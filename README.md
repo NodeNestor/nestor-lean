@@ -41,7 +41,11 @@ When the model reads a **large code file** while *exploring* (not while error-hu
 
 The header says exactly how to get the full file (re-run the same Read), and the same escape valve applies. Any error-hunting vocabulary in the recent conversation ("exception", "traceback", "failing"...) disables codemap entirely — when debugging, the model gets real bytes. Parsers cover Python, JS/TS, C#/Razor/Java, Go/Rust, C/C++ and more.
 
-### 3. Duplicate collapse — reads, greps, and command output
+### 3. Project codemap — a skill the model invokes itself
+
+The plugin ships a `codemap` skill: when Claude starts exploring an unfamiliar codebase, it can map an **entire directory in one call** instead of reading a dozen files — folder tree, file-type counts, and every code file's signatures with real line numbers (`python hooks/codemap.py <dir>` under the hood). Measured on a real 51-file repo: 237K chars of source → 37K chars of map (**84% reduction**) while keeping everything needed to navigate. The skill's own instructions tell the model to Read real files before quoting or editing.
+
+### 4. Duplicate collapse — reads, greps, and command output
 
 - **Read** of duplicate-heavy non-code files (logs, dumps): runs of identical consecutive lines collapse to one line + `… [previous line repeats 199x, through line 201]` — real line numbers preserved, so `offset`/`limit` re-reads still make sense.
 - **Grep** (content mode): identical match text within a file collapses with counts; matches capped per file with an explicit note. **Never** applied when the pattern looks like an error hunt — then every occurrence may matter.
