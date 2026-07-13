@@ -8,9 +8,14 @@ base = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.join(
 )
 sessions_dir = os.path.join(base, "sessions")
 
-total_chars = 0
-read_refs = 0
-grep_compressions = 0
+totals = {
+    "saved_chars": 0,
+    "read_refs": 0,
+    "read_collapses": 0,
+    "grep_compressions": 0,
+    "bash_collapses": 0,
+    "codemaps": 0,
+}
 sessions = 0
 
 if os.path.isdir(sessions_dir):
@@ -21,14 +26,16 @@ if os.path.isdir(sessions_dir):
         except Exception:
             continue
         sessions += 1
-        total_chars += s.get("saved_chars", 0)
-        read_refs += s.get("read_refs", 0)
-        grep_compressions += s.get("grep_compressions", 0)
+        for k in totals:
+            totals[k] += s.get(k, 0)
 
-print("nestor-lean savings (state retained for ~48h per session)")
-print("=" * 56)
-print("Sessions tracked:      {}".format(sessions))
-print("Duplicate reads deduped: {}".format(read_refs))
-print("Grep outputs compressed: {}".format(grep_compressions))
-print("Chars saved:           {:,}".format(total_chars))
-print("~Tokens saved:         {:,}  (chars/4 estimate)".format(total_chars // 4))
+print("nestor-lean savings (state retained for ~48h per agent context)")
+print("=" * 60)
+print("Agent contexts tracked:   {}".format(sessions))
+print("Duplicate reads -> refs:  {}".format(totals["read_refs"]))
+print("Codemaps served:          {}".format(totals["codemaps"]))
+print("Read outputs collapsed:   {}".format(totals["read_collapses"]))
+print("Grep outputs compressed:  {}".format(totals["grep_compressions"]))
+print("Bash outputs collapsed:   {}".format(totals["bash_collapses"]))
+print("Chars saved:              {:,}".format(totals["saved_chars"]))
+print("~Tokens saved:            {:,}  (chars/4 estimate)".format(totals["saved_chars"] // 4))
