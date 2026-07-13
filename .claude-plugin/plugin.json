@@ -1,0 +1,9 @@
+{
+  "name": "nestor-lean",
+  "version": "0.1.0",
+  "description": "Input-side token compression for Claude Code: repeated file reads become context references, bulky grep output gets collapsed. Companion to rolling-context.",
+  "author": {
+    "name": "NodeNestor"
+  },
+  "hooks": "./hooks/hooks.json"
+}
