@@ -138,7 +138,7 @@ def main():
     assert run(ev, env) is not None, "and dedup resumes after that"
     run({"hook_event_name": "SessionEnd", "session_id": "s1",
          "transcript_path": explore_transcript}, env)
-    assert run(ev, env) is None, "after SessionEnd state is gone -> full read"
+    assert run(ev, env) is None, "after SessionEnd dedup knowledge is cleared -> full read"
 
     # =====================================================================
     # 3. rolling-context invalidation

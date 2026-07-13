@@ -687,18 +687,20 @@ def main():
     event = payload.get("hook_event_name")
     key = context_key(payload)
 
-    if event == "PreCompact":
+    if event in ("PreCompact", "SessionEnd"):
+        # Compaction: everything the model "already saw" may be gone.
+        # Session end: dedup knowledge must not leak into a resumed session.
+        # Savings counters survive either way so /nestor-lean:gain still
+        # reports them (files are pruned after 48h).
         state = load_state(key)
         state["reads"] = {}
         save_state(key, state)
-        return
-    if event == "SessionEnd":
-        delete_state(key)
         return
 
     tool = payload.get("tool_name")
     state = load_state(key)
     replacement = None
+    error = None
     try:
         if tool == "Read":
             replacement = handle_read(payload, state)
@@ -706,10 +708,24 @@ def main():
             replacement = handle_grep(payload, state)
         elif tool == "Bash":
             replacement = handle_bash(payload, state)
-    except Exception:
+    except Exception as e:
         replacement = None
+        error = "{}: {}".format(type(e).__name__, e)
 
     save_state(key, state)
+
+    if dump:
+        try:
+            with open(dump, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "_lean_decision": bool(replacement),
+                    "error": error,
+                    "key": key,
+                    "reads_after": len(state.get("reads", {})),
+                    "data_dir": data_dir(),
+                }) + "\n")
+        except Exception:
+            pass
     prune_old_sessions()
 
     if replacement is not None:
