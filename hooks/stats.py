@@ -18,6 +18,7 @@ totals = {
     "bash_routes": 0,
     "rtk_pipes": 0,
     "rtk_rewrites": 0,
+    "mcp_compressions": 0,
     "codemaps": 0,
 }
 sessions = 0
@@ -41,6 +42,7 @@ print("Changed reads -> diffs:   {}".format(totals["diff_reads"]))
 print("Codemaps served:          {}".format(totals["codemaps"]))
 print("Read outputs collapsed:   {}".format(totals["read_collapses"]))
 print("Grep outputs compressed:  {}".format(totals["grep_compressions"]))
+print("MCP outputs compressed:   {}".format(totals["mcp_compressions"]))
 print("rtk filters applied:      {}".format(totals["rtk_pipes"]))
 print("rtk command rewrites:     {}".format(totals["rtk_rewrites"]))
 print("Built-in routes fired:    {}".format(totals["bash_routes"]))

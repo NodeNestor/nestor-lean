@@ -70,6 +70,8 @@ MIN_DEDUP_CHARS = _env_int("NESTOR_LEAN_MIN_DEDUP_CHARS", 1500)
 GREP_MIN_CHARS = _env_int("NESTOR_LEAN_GREP_MIN_CHARS", 4000)
 GREP_PER_FILE_CAP = _env_int("NESTOR_LEAN_GREP_PER_FILE_CAP", 25)
 BASH_MIN_CHARS = _env_int("NESTOR_LEAN_BASH_MIN_CHARS", 4000)
+MCP_MIN_CHARS = _env_int("NESTOR_LEAN_MCP_MIN_CHARS", 3000)
+MCP_ENABLED = os.environ.get("NESTOR_LEAN_MCP", "1") != "0"
 COLLAPSE_MIN_RUN = _env_int("NESTOR_LEAN_COLLAPSE_MIN_RUN", 5)
 CODEMAP_MIN_CHARS = _env_int("NESTOR_LEAN_CODEMAP_MIN_CHARS", 12000)
 CODEMAP_ENABLED = os.environ.get("NESTOR_LEAN_CODEMAP", "1") != "0"
@@ -169,6 +171,7 @@ def load_state(key):
             "bash_routes": 0,
             "rtk_pipes": 0,
             "rtk_rewrites": 0,
+            "mcp_compressions": 0,
             "codemaps": 0,
             "rc_probe": None,
         }
@@ -288,6 +291,20 @@ def extract_text_and_carrier(payload):
                     repl["content"] = [{"type": "text", "text": new}]
                     return repl
                 return "\n".join(texts), rebuild_blocks
+
+    # Bare content-block list — the shape MCP tools return:
+    #   [{"type": "text", "text": "..."}, ...]
+    if isinstance(out, list):
+        texts = [
+            b.get("text")
+            for b in out
+            if isinstance(b, dict) and isinstance(b.get("text"), str)
+        ]
+        # only carry when every block is plain text (don't drop images etc.)
+        if texts and len(texts) == len([b for b in out if isinstance(b, dict)]):
+            def rebuild_list(new):
+                return [{"type": "text", "text": new}]
+            return "\n".join(texts), rebuild_list
 
     return None, None
 
@@ -944,6 +961,85 @@ def handle_grep(payload, state):
     return header + new_text
 
 
+SCRIPT_STYLE = re.compile(r"(?is)<script\b.*?</script>|<style\b.*?</style>|<!--.*?-->")
+FENCED_JSON = re.compile(r"```(?:json)?\s*\n(\{.*?\}|\[.*?\])\s*\n```", re.S)
+
+
+def _minify_fenced_json(text):
+    """Minify JSON inside ```json fences (common in MCP markdown). Lossless:
+    only well-formed JSON blocks are rewritten, and only when smaller."""
+    def repl(m):
+        block = m.group(1)
+        try:
+            obj = json.loads(block)
+        except Exception:
+            return m.group(0)
+        compact = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        if len(compact) < len(block) * 0.95:
+            return "```json\n" + compact + "\n```"
+        return m.group(0)
+    return FENCED_JSON.sub(repl, text)
+
+
+def handle_mcp(payload, state):
+    """Deterministic, tee-backed compression of MCP tool output.
+
+    MCP servers routinely return large JSON or HTML. We shrink it losslessly-
+    or-recoverably: minify pretty-printed JSON, drop <script>/<style>/comment
+    blocks the model never needs, and collapse runs of identical lines. The
+    full output is teed to a file referenced in the header. Nothing is
+    paraphrased; structured values are preserved exactly (minified JSON is
+    still valid JSON)."""
+    text = extract_text(payload)
+    if not text or len(text) < MCP_MIN_CHARS:
+        return None
+    original = text
+    out = text
+    notes = []
+
+    stripped = out.strip()
+    if stripped[:1] in ("{", "["):
+        try:
+            obj = json.loads(stripped)
+            compact = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+            if len(compact) < len(out) * 0.95:
+                out = compact
+                notes.append("JSON minified")
+        except Exception:
+            pass
+    elif "```" in out:
+        new = _minify_fenced_json(out)
+        if len(new) < len(out) * 0.95:
+            out = new
+            notes.append("fenced JSON minified")
+
+    low = out.lower()
+    if "<script" in low or "<style" in low or "<!--" in low:
+        new = SCRIPT_STYLE.sub("", out)
+        if len(new) < len(out) * 0.98:
+            out = new
+            notes.append("script/style/comments stripped")
+
+    collapsed = collapse_duplicate_lines(out, COLLAPSE_MIN_RUN, preserve_read_numbers=False)
+    if collapsed is not None and len(collapsed) < len(out):
+        out = collapsed
+        notes.append("duplicate lines collapsed")
+
+    if not notes or len(out) >= len(original) * (1 - MIN_SAVING_RATIO):
+        return None
+
+    tee = write_tee(original)
+    header = "[nestor-lean] MCP output compressed ({}): {} -> {} chars.".format(
+        ", ".join(notes), len(original), len(out)
+    )
+    if tee:
+        header += " Full untouched output saved to {} — Read it for anything dropped.".format(tee)
+    header += "\n"
+    state["saved_chars"] += len(original) - len(out) - len(header)
+    state["mcp_compressions"] = state.get("mcp_compressions", 0) + 1
+    return header + out
+
+
 def handle_bash(payload, state):
     text = extract_text(payload)
     if not text or len(text) < BASH_MIN_CHARS:
@@ -1101,6 +1197,8 @@ def main():
             replacement = handle_grep(payload, state)
         elif tool == "Bash":
             replacement = handle_bash(payload, state)
+        elif MCP_ENABLED and tool and tool.startswith("mcp__"):
+            replacement = handle_mcp(payload, state)
     except Exception as e:
         replacement = None
         error = "{}: {}".format(type(e).__name__, e)

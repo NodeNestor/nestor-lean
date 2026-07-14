@@ -30,6 +30,9 @@ All command compression is backed by a **tee file**: the full output is written 
 ### 5. Grep compression
 Identical matches within a file collapse with counts; per-file caps. Skipped entirely for error-hunting patterns (every occurrence may matter).
 
+### 6. MCP tool-output compression
+MCP servers routinely return large JSON or HTML. nestor-lean shrinks it **deterministically and losslessly-or-recoverably**: minify pretty-printed JSON (whole-output or inside ```json fences — still valid JSON, exact values preserved), drop `<script>`/`<style>`/comment blocks the model never needs, and collapse runs of identical lines. Tee-backed, so the full untouched output is one Read away. Structured data is never paraphrased. Measured live: a script/style-heavy HTML payload from a real MCP tool, 22,711 → ~750 chars (97%). Mixed outputs containing images are left untouched.
+
 ## Context awareness
 
 - **Per-agent scoping** — state keyed by `transcript_path`; simultaneous subagents never share dedup/diff knowledge.
@@ -63,12 +66,13 @@ Requires Python 3.7+ (stdlib only). To enable the real-rtk tier, either install 
 | `NESTOR_LEAN_RTK_REWRITE` | — | `1` enables PreToolUse command rewriting (re-executes via rtk) |
 | `NESTOR_LEAN_RTK` | — | explicit path to an rtk binary |
 | `NESTOR_LEAN_BASH_ROUTES` | `1` | `0` disables built-in command routes |
+| `NESTOR_LEAN_MCP` | `1` | `0` disables MCP output compression |
 | `NESTOR_LEAN_DEDUP_WINDOW` | `1200` | seconds a read stays dedup/diff-able |
 | `NESTOR_LEAN_GREP_PER_FILE_CAP` | `25` | max grep matches kept per file |
 
 ## How it works
 
-Hooks: `PostToolUse` (Read/Grep/Bash transforms), `PreToolUse` (opt-in rtk rewrite), `PreCompact`/`SessionEnd` (invalidation), `SessionStart` (opt-in rtk bootstrap). Replacements are rebuilt in each tool's original output shape (Claude Code validates `updatedToolOutput` against the tool's schema). State is per-agent JSON + content blobs under `${CLAUDE_PLUGIN_DATA}`, pruned after 48h. Pure-stdlib Python; the only optional external piece is the rtk binary, which is never required.
+Hooks: `PostToolUse` (Read/Grep/Bash/MCP transforms), `PreToolUse` (opt-in rtk rewrite), `PreCompact`/`SessionEnd` (invalidation), `SessionStart` (opt-in rtk bootstrap). Replacements are rebuilt in each tool's original output shape (Claude Code validates `updatedToolOutput` against the tool's schema). State is per-agent JSON + content blobs under `${CLAUDE_PLUGIN_DATA}`, pruned after 48h. Pure-stdlib Python; the only optional external piece is the rtk binary, which is never required.
 
 ## Test
 

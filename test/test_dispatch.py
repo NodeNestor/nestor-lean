@@ -42,6 +42,10 @@ def run(payload, env_extra=None):
         for k in ("output", "content", "text", "result", "stdout"):
             if isinstance(out.get(k), str):
                 return out[k]
+    if isinstance(out, list):  # MCP content-block list
+        texts = [b.get("text") for b in out if isinstance(b, dict) and isinstance(b.get("text"), str)]
+        if texts:
+            return "\n".join(texts)
     return out
 
 
@@ -436,7 +440,54 @@ def main():
     assert not p2.stdout.strip(), "rewrite off by default"
 
     # =====================================================================
-    # 12. disable switches
+    # 12. MCP output compression (bare content-block list shape)
+    # =====================================================================
+    # pretty-printed JSON payload, as an MCP server returns it
+    big_obj = {"items": [{"id": i, "name": "item_{}".format(i), "active": True,
+                          "tags": ["a", "b", "c"]} for i in range(200)]}
+    pretty = json.dumps(big_obj, indent=2)
+    mcp_resp = [{"type": "text", "text": pretty}]
+    ev_mcp = {
+        "session_id": "s12", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "mcp__someserver__query",
+        "tool_input": {"q": "list items"},
+        "tool_response": mcp_resp,
+    }
+    # raw (dict) output to check shape preservation
+    raw = run_raw(ev_mcp, env)
+    assert isinstance(raw, list) and raw and raw[0].get("type") == "text", "MCP replacement stays a content-block list"
+    body = raw[0]["text"]
+    assert "MCP output compressed" in body and "JSON minified" in body, "minifies pretty JSON"
+    assert '"item_199"' in body, "keeps all data (lossless minify)"
+    assert "Full untouched output saved to" in body, "tee-backed"
+    assert len(body) < len(pretty) * 0.85, "actually saves"
+
+    # HTML with script/style gets those stripped
+    html = ("<html><head><style>" + "body{color:red}\n" * 200 + "</style>"
+            "<script>" + "console.log(1);\n" * 200 + "</script></head>"
+            "<body><h1>Real Content</h1><p>Keep me</p></body></html>")
+    ev_html = dict(ev_mcp, session_id="s12b",
+                   tool_response=[{"type": "text", "text": html}])
+    h = run(ev_html, env)
+    assert h and "script/style" in h, "strips script/style"
+    assert "Real Content" in h and "Keep me" in h, "keeps real content"
+    assert "console.log" not in h, "drops script body"
+
+    # small MCP output passes through untouched
+    small = dict(ev_mcp, session_id="s12c",
+                 tool_response=[{"type": "text", "text": '{"ok":true}'}])
+    assert run(small, env) is None, "small MCP output untouched"
+
+    # MCP output with a non-text block (image) is left alone (don't drop it)
+    mixed = dict(ev_mcp, session_id="s12d", tool_response=[
+        {"type": "text", "text": pretty},
+        {"type": "image", "data": "base64..."},
+    ])
+    assert run(mixed, env) is None, "mixed image+text MCP output left untouched"
+
+    # =====================================================================
+    # 13. disable switches
     # =====================================================================
     assert run(ev, dict(env, NESTOR_LEAN_DISABLE="1")) is None
     assert run(ev_dotnet, dict(env, NESTOR_LEAN_BASH_ROUTES="0", CLAUDE_PLUGIN_DATA=tmp + "-nr")) != (
