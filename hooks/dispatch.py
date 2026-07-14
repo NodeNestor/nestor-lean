@@ -48,6 +48,7 @@ of the model's context, so it is never turned into a reference — full content
 is served instead. The signal is global across sessions (conservative: a
 compression anywhere only costs savings, never correctness).
 """
+import difflib
 import hashlib
 import json
 import os
@@ -72,6 +73,13 @@ BASH_MIN_CHARS = _env_int("NESTOR_LEAN_BASH_MIN_CHARS", 4000)
 COLLAPSE_MIN_RUN = _env_int("NESTOR_LEAN_COLLAPSE_MIN_RUN", 5)
 CODEMAP_MIN_CHARS = _env_int("NESTOR_LEAN_CODEMAP_MIN_CHARS", 12000)
 CODEMAP_ENABLED = os.environ.get("NESTOR_LEAN_CODEMAP", "1") != "0"
+BASH_ROUTES_ENABLED = os.environ.get("NESTOR_LEAN_BASH_ROUTES", "1") != "0"
+RTK_ENABLED = os.environ.get("NESTOR_LEAN_RTK_PIPE", "1") != "0"
+TEE_MAX_AGE = 6 * 3600
+DIFF_ENABLED = os.environ.get("NESTOR_LEAN_DIFF", "1") != "0"
+DIFF_MAX_CONTENT = 512 * 1024       # don't blob/diff files larger than this
+DIFF_MAX_CHANGE_RATIO = 0.45        # above this, a full read is clearer than a diff
+DIFF_CONTEXT = 3                    # context lines around each changed hunk
 MIN_SAVING_RATIO = 0.20
 HASH_CAP_BYTES = 4 * 1024 * 1024
 STATE_MAX_AGE = 48 * 3600
@@ -155,8 +163,12 @@ def load_state(key):
             "saved_chars": 0,
             "read_refs": 0,
             "read_collapses": 0,
+            "diff_reads": 0,
             "grep_compressions": 0,
             "bash_collapses": 0,
+            "bash_routes": 0,
+            "rtk_pipes": 0,
+            "rtk_rewrites": 0,
             "codemaps": 0,
             "rc_probe": None,
         }
@@ -489,9 +501,257 @@ def collapse_duplicate_lines(text, min_run, preserve_read_numbers):
     return "\n".join(out)
 
 
+# ------------------------------------------------ content blobs (diffs) ----
+
+def blobs_root():
+    base = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.join(
+        os.path.expanduser("~"), ".nestor-lean"
+    )
+    return os.path.join(base, "blobs")
+
+
+def blob_dir(ckey):
+    d = os.path.join(blobs_root(), ckey)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def blob_path(ckey, read_key):
+    h = hashlib.sha1(read_key.encode("utf-8", "replace")).hexdigest()[:16]
+    return os.path.join(blob_dir(ckey), h + ".txt")
+
+
+def store_blob(ckey, read_key, text):
+    try:
+        p = blob_path(ckey, read_key)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, p)
+        return True
+    except Exception:
+        return False
+
+
+def load_blob(ckey, read_key):
+    try:
+        with open(blob_path(ckey, read_key), "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def prune_blobs():
+    try:
+        root = blobs_root()
+        if not os.path.isdir(root):
+            return
+        now = time.time()
+        for ck in os.listdir(root):
+            cdir = os.path.join(root, ck)
+            if not os.path.isdir(cdir):
+                continue
+            remaining = 0
+            for n in os.listdir(cdir):
+                p = os.path.join(cdir, n)
+                try:
+                    if now - os.path.getmtime(p) > STATE_MAX_AGE:
+                        os.remove(p)
+                    else:
+                        remaining += 1
+                except Exception:
+                    remaining += 1
+            if remaining == 0:
+                try:
+                    os.rmdir(cdir)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def build_diff_view(old_text, new_text, fp, age_min):
+    """A unified-diff-style view of a changed file: only the changed hunks,
+    with real (current) line numbers. Returns None if the change is too large
+    to be worth a diff (caller then serves the full file)."""
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    if 1.0 - sm.ratio() > DIFF_MAX_CHANGE_RATIO:
+        return None
+    hunks = []
+    for group in sm.get_grouped_opcodes(DIFF_CONTEXT):
+        rendered = []
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                for k in range(j1, j2):
+                    rendered.append("  {:>6}  {}".format(k + 1, new_lines[k]))
+            else:
+                for k in range(i1, i2):
+                    rendered.append("  -       {}".format(old_lines[k]))
+                for k in range(j1, j2):
+                    rendered.append("  + {:>6}  {}".format(k + 1, new_lines[k]))
+        first_new = group[0][3] + 1
+        hunks.append("@@ around line {} @@\n{}".format(first_new, "\n".join(rendered)))
+    if not hunks:
+        return None
+    header = (
+        "[nestor-lean] FILE CHANGED since your earlier read (~{} min ago). "
+        "Only the changed regions are shown below; every other line is "
+        "UNCHANGED from the version already in your context. '+' lines with "
+        "numbers are the current file; '-' lines are what they replaced. "
+        "Line numbers are the current file's real numbers. To get the full "
+        "current file (e.g. before a large edit), run the exact same Read "
+        "again.\n  file: {}\n".format(age_min, fp)
+    )
+    return header + "\n".join(hunks)
+
+
+# --------------------------------------------- rtk-style command routes ----
+
+def tee_dir():
+    base = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.join(
+        os.path.expanduser("~"), ".nestor-lean"
+    )
+    d = os.path.join(base, "tee")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def write_tee(text):
+    """Write full command output to a recovery file so an aggressive route can
+    be undone by one Read. Returns the path, or None on failure."""
+    try:
+        d = tee_dir()
+        now = time.time()
+        for n in os.listdir(d):
+            p = os.path.join(d, n)
+            try:
+                if now - os.path.getmtime(p) > TEE_MAX_AGE:
+                    os.remove(p)
+            except Exception:
+                pass
+        h = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:12]
+        path = os.path.join(d, h + ".txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+    except Exception:
+        return None
+
+
+def _dedupe_keep(lines):
+    seen = set()
+    out = []
+    for l in lines:
+        k = l.strip()
+        if k and k in seen:
+            continue
+        seen.add(k)
+        out.append(l)
+    return out
+
+
+class BashRoute:
+    name = "base"
+
+    def matches(self, command):
+        return False
+
+    def transform(self, text):
+        """Return (compressed_text, kept_description) or None."""
+        return None
+
+
+class DotnetBuildRoute(BashRoute):
+    """dotnet build/publish/run/msbuild/pack — keep diagnostics + summary."""
+    name = "dotnet-build"
+    _cmd = re.compile(r"\bdotnet\s+(build|publish|run|msbuild|pack)\b|\bmsbuild\b")
+    _keep = re.compile(
+        r"\)\s*:\s*(error|warning)\s"          # File.cs(1,2): error CS0103 ...
+        r"|\bBuild (succeeded|FAILED)\b"
+        r"|\b\d+\s+(Error|Warning)\(s\)"
+        r"|\bTime Elapsed\b"
+        r"|\berror\b(?!\s*[:=]\s*(0|false))"   # bare 'error' but not 'errors: 0'
+        r"|: error |: warning ",
+        re.I,
+    )
+
+    def matches(self, command):
+        return bool(self._cmd.search(command))
+
+    def transform(self, text):
+        lines = text.splitlines()
+        kept = _dedupe_keep([l for l in lines if l.strip() and self._keep.search(l)])
+        if not kept:
+            return None
+        return "\n".join(kept), "compiler errors, warnings, and build summary"
+
+
+class TestRunnerRoute(BashRoute):
+    """Test runners (dotnet test, pytest, playwright, jest, vitest, go/cargo
+    test) — keep failures, assertion detail, and the final summary; drop the
+    passing-test noise."""
+    name = "test-runner"
+    _cmd = re.compile(
+        r"\bdotnet\s+test\b|\bpytest\b|\bplaywright\s+test\b|\bnpx\s+playwright\b"
+        r"|\bjest\b|\bvitest\b|\bgo\s+test\b|\bcargo\s+test\b|\bnpm\s+(run\s+)?test\b"
+    )
+    _keep = re.compile(
+        r"\bFAIL(ED|URE)?\b|\bERROR\b|\bexception\b|\btraceback\b"
+        r"|\bassert|\bexpect(ed)?\b"
+        r"|^\s*✘|^\s*✗|^\s*×|^\s*[-–]\s"                      # failure bullets
+        r"|\bPassed!|\bFailed!|\bTotal tests\b|\bTest Run\b"  # vstest
+        r"|=+\s*\d+\s+(passed|failed|error)"                 # pytest summary
+        r"|\b\d+\s+(passed|failed|skipped|pending|flaky)\b"  # jest/playwright/pw
+        r"|\bok\b\s+\d|\b--- FAIL|\bPASS\b\s|\bFAIL\b\s"      # go test
+        r"|\btest result:\b",                                # cargo
+        re.I,
+    )
+
+    def matches(self, command):
+        return bool(self._cmd.search(command))
+
+    def transform(self, text):
+        lines = text.splitlines()
+        kept = [l for l in lines if l.strip() and self._keep.search(l)]
+        if not kept:
+            return None
+        return "\n".join(kept), "failures, assertion detail, and the run summary"
+
+
+class PackageInstallRoute(BashRoute):
+    """npm/pnpm/yarn/pip install — keep the result summary + errors, drop the
+    per-package progress spam."""
+    name = "package-install"
+    _cmd = re.compile(
+        r"\b(npm|pnpm|yarn)\s+(install|i|ci|add)\b|\bpip3?\s+install\b"
+    )
+    _keep = re.compile(
+        r"\berror\b|\bwarn(ing)?\b|\bfail|\bENO|\bpeer\b|\bdeprecated\b"
+        r"|added \d+|removed \d+|changed \d+|audited \d+"
+        r"|\d+ vulnerabilit|up to date|Successfully installed|Requirement already"
+        r"|\bDone\b|\bPackages:|\+\d+",
+        re.I,
+    )
+
+    def matches(self, command):
+        return bool(self._cmd.search(command))
+
+    def transform(self, text):
+        lines = text.splitlines()
+        kept = _dedupe_keep([l for l in lines if l.strip() and self._keep.search(l)])
+        if not kept:
+            return None
+        return "\n".join(kept), "install summary, warnings, and errors"
+
+
+BASH_ROUTES = [DotnetBuildRoute(), TestRunnerRoute(), PackageInstallRoute()]
+
+
 # ------------------------------------------------------------- handlers ----
 
-def handle_read(payload, state):
+def handle_read(payload, state, ckey):
     ti = payload.get("tool_input") or {}
     fp = ti.get("file_path")
     if not fp or not os.path.isfile(fp):
@@ -511,20 +771,21 @@ def handle_read(payload, state):
     rec = state["reads"].get(key)
     ext = os.path.splitext(fp)[1].lower()
     is_code = ext in CODE_EXTS
+    rc_ts = rc_last_injection(state)
+    base_still_valid = not (rc_ts and rec and rc_ts > rec.get("ts", 0))
 
-    # ---- 1. dedup-by-reference -----------------------------------------
+    # ---- 1. dedup-by-reference (file unchanged) ------------------------
     if rec and rec.get("digest") == digest and (now - rec.get("ts", 0)) <= DEDUP_WINDOW:
         if rec.get("ref_served") or rec.get("map_served"):
             # Escape valve: model asked again after a reference/map ->
             # it needs the real bytes. Serve full, reset cycle.
-            rec.update(ts=now, ref_served=False, map_served=False)
+            rec.update(ts=now, ref_served=False, map_served=False, served_full=True)
             return None
         # rolling-context check: if a compression was injected AFTER this
         # read was recorded, the earlier content may be summarized away ->
         # never point at it; refresh the record with this full read instead.
-        rc_ts = rc_last_injection(state)
-        if rc_ts and rc_ts > rec.get("ts", 0):
-            rec.update(ts=now, ref_served=False, map_served=False)
+        if not base_still_valid:
+            rec.update(ts=now, ref_served=False, map_served=False, served_full=True)
             return None
         age_min = max(1, int((now - rec.get("ts", now)) / 60))
         rec.update(ts=now, ref_served=True)
@@ -533,18 +794,51 @@ def handle_read(payload, state):
         state["read_refs"] += 1
         return dedup_note(fp, digest, age_min, text or "", size_bytes)
 
+    # ---- 2. differential read (file changed, base still in context) -----
+    # Only against a base that was served IN FULL and is still valid; a diff
+    # lets the model reconstruct the current file from what it already has.
+    if (
+        DIFF_ENABLED
+        and rec is not None
+        and rec.get("digest") != digest
+        and rec.get("served_full")
+        and rec.get("has_blob")
+        and base_still_valid
+        and (now - rec.get("ts", 0)) <= DEDUP_WINDOW
+        and text is not None
+        and approx_len >= MIN_DEDUP_CHARS
+        and approx_len <= DIFF_MAX_CONTENT
+    ):
+        old_text = load_blob(ckey, key)
+        if old_text is not None:
+            age_min = max(1, int((now - rec.get("ts", now)) / 60))
+            view = build_diff_view(old_text, text, fp, age_min)
+            if view is not None and len(view) < approx_len * (1 - MIN_SAVING_RATIO):
+                store_blob(ckey, key, text)
+                rec.update(digest=digest, ts=now, ref_served=False,
+                           map_served=False, served_full=True, has_blob=True)
+                state["saved_chars"] += approx_len - len(view)
+                state["diff_reads"] = state.get("diff_reads", 0) + 1
+                return view
+
     new_rec = {
         "digest": digest,
         "ts": now,
         "ref_served": False,
         "map_served": False,
+        "served_full": False,
+        "has_blob": False,
     }
     state["reads"][key] = new_rec
 
     if text is None:
         return None
 
-    # ---- 2. codemap for exploration reads of big code files -------------
+    # Store the full content as a blob so a future changed re-read can diff.
+    if DIFF_ENABLED and approx_len <= DIFF_MAX_CONTENT:
+        new_rec["has_blob"] = store_blob(ckey, key, text)
+
+    # ---- 3. codemap for exploration reads of big code files -------------
     if (
         CODEMAP_ENABLED
         and is_code
@@ -560,7 +854,7 @@ def handle_read(payload, state):
             state["codemaps"] += 1
             return cmap
 
-    # ---- 3. duplicate collapse for big non-code reads --------------------
+    # ---- 4. duplicate collapse for big non-code reads --------------------
     if not is_code and approx_len >= GREP_MIN_CHARS:
         collapsed = collapse_duplicate_lines(
             text, COLLAPSE_MIN_RUN, preserve_read_numbers=True
@@ -576,6 +870,8 @@ def handle_read(payload, state):
             state["read_collapses"] += 1
             return header + collapsed
 
+    # Served the file in full -> a valid base for a future differential read.
+    new_rec["served_full"] = True
     return None
 
 
@@ -652,6 +948,57 @@ def handle_bash(payload, state):
     text = extract_text(payload)
     if not text or len(text) < BASH_MIN_CHARS:
         return None
+    command = str((payload.get("tool_input") or {}).get("command") or "")
+
+    # ---- 0. real rtk parser via `rtk pipe` (no re-execution) ------------
+    # If the rtk binary is available and the command maps to one of its
+    # stream filters, reshape the captured output with rtk's own parser.
+    # The real command already ran untouched; we only change what enters
+    # context. Backed by a tee so nothing is unrecoverable.
+    if RTK_ENABLED and command:
+        try:
+            import rtk as _rtk
+            rtk_path = _rtk.find_rtk()
+            filt = _rtk.pipe_filter_for(command) if rtk_path else None
+            if rtk_path and filt:
+                compressed = _rtk.run_pipe(rtk_path, filt, text)
+                if compressed and len(compressed) < len(text) * (1 - MIN_SAVING_RATIO):
+                    tee = write_tee(text)
+                    header = "[nestor-lean] rtk:{} filter applied ({} -> {} lines).".format(
+                        filt, len(text.splitlines()), len(compressed.splitlines())
+                    )
+                    if tee:
+                        header += " Full output saved to {} — Read it for any dropped detail.".format(tee)
+                    header += "\n"
+                    state["saved_chars"] += len(text) - len(compressed) - len(header)
+                    state["rtk_pipes"] = state.get("rtk_pipes", 0) + 1
+                    return header + compressed
+        except Exception:
+            pass
+
+    # ---- 1. format-aware route (built-in), backed by a full-output tee ---
+    if BASH_ROUTES_ENABLED and command:
+        for route in BASH_ROUTES:
+            if not route.matches(command):
+                continue
+            result = route.transform(text)
+            if not result:
+                break
+            compressed, kept_desc = result
+            if len(compressed) >= len(text) * (1 - MIN_SAVING_RATIO):
+                break
+            tee = write_tee(text)
+            header = "[nestor-lean] {} output reduced to {} ({} -> {} lines).".format(
+                route.name, kept_desc, len(text.splitlines()), len(compressed.splitlines())
+            )
+            if tee:
+                header += " Full output saved to {} — Read it for any dropped detail.".format(tee)
+            header += "\n"
+            state["saved_chars"] += len(text) - len(compressed) - len(header)
+            state["bash_routes"] = state.get("bash_routes", 0) + 1
+            return header + compressed
+
+    # ---- 2. generic fallback: collapse runs of identical lines (lossless) -
     collapsed = collapse_duplicate_lines(
         text, COLLAPSE_MIN_RUN, preserve_read_numbers=False
     )
@@ -687,6 +1034,35 @@ def main():
     event = payload.get("hook_event_name")
     key = context_key(payload)
 
+    if event == "PreToolUse":
+        # Opt-in: rewrite a supported simple command to its rtk equivalent so
+        # its output is born compressed. Off by default because it changes the
+        # command that actually executes (rtk re-runs it). Enable with
+        # NESTOR_LEAN_RTK_REWRITE=1.
+        if (
+            os.environ.get("NESTOR_LEAN_RTK_REWRITE") == "1"
+            and payload.get("tool_name") == "Bash"
+        ):
+            command = str((payload.get("tool_input") or {}).get("command") or "")
+            try:
+                import rtk as _rtk
+                rtk_path = _rtk.find_rtk()
+                if rtk_path and command:
+                    new_cmd = _rtk.rewrite_command(rtk_path, command)
+                    if new_cmd:
+                        state = load_state(key)
+                        state["rtk_rewrites"] = state.get("rtk_rewrites", 0) + 1
+                        save_state(key, state)
+                        print(json.dumps({
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "updatedInput": {"command": new_cmd},
+                            }
+                        }))
+            except Exception:
+                pass
+        return
+
     if event in ("PreCompact", "SessionEnd"):
         # Compaction: everything the model "already saw" may be gone.
         # Session end: dedup knowledge must not leak into a resumed session.
@@ -695,6 +1071,23 @@ def main():
         state = load_state(key)
         state["reads"] = {}
         save_state(key, state)
+        # Diff/dedup bases are only valid against content still in the model's
+        # context — after a compaction or session end that is gone, so drop
+        # this context's stored blobs too.
+        try:
+            cdir = os.path.join(blobs_root(), key)
+            if os.path.isdir(cdir):
+                for n in os.listdir(cdir):
+                    try:
+                        os.remove(os.path.join(cdir, n))
+                    except Exception:
+                        pass
+                try:
+                    os.rmdir(cdir)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         return
 
     tool = payload.get("tool_name")
@@ -703,7 +1096,7 @@ def main():
     error = None
     try:
         if tool == "Read":
-            replacement = handle_read(payload, state)
+            replacement = handle_read(payload, state, key)
         elif tool == "Grep":
             replacement = handle_grep(payload, state)
         elif tool == "Bash":
@@ -727,6 +1120,7 @@ def main():
         except Exception:
             pass
     prune_old_sessions()
+    prune_blobs()
 
     if replacement is not None:
         # Rebuild the replacement in the original output's shape — Claude

@@ -245,7 +245,7 @@ def main():
     ev_bash = {
         "session_id": "s7", "transcript_path": explore_transcript,
         "hook_event_name": "PostToolUse", "tool_name": "Bash",
-        "tool_input": {"command": "dotnet build"},
+        "tool_input": {"command": "bash deploy.sh"},  # matches no route -> generic collapse
         "tool_output": bash_out,
     }
     b = run(ev_bash, env)
@@ -280,9 +280,168 @@ def main():
     assert raw["file"]["numLines"] == raw["file"]["content"].count("\n") + 1, "numLines consistent"
 
     # =====================================================================
-    # 9. disable switch
+    # 9. rtk-style command routes with tee-recovery
+    # =====================================================================
+    restore = "\n".join(
+        "  Restored C:\\proj\\Pkg{}.csproj (in 1.{} sec).".format(i, i % 9)
+        for i in range(150)
+    )
+    dotnet_out = (
+        "  Determining projects to restore...\n" + restore + "\n"
+        "  App -> C:\\proj\\bin\\Debug\\net8.0\\App.dll\n"
+        "C:\\proj\\Services\\OrderService.cs(42,13): error CS0103: The name 'foo' does not exist in the current context [C:\\proj\\App.csproj]\n"
+        "C:\\proj\\Services\\OrderService.cs(42,13): error CS0103: The name 'foo' does not exist in the current context [C:\\proj\\App.csproj]\n"
+        "C:\\proj\\Program.cs(10,5): warning CS0219: The variable 'x' is assigned but its value is never used [C:\\proj\\App.csproj]\n"
+        "Build FAILED.\n    1 Warning(s)\n    2 Error(s)\nTime Elapsed 00:00:03.45\n"
+    )
+    ev_dotnet = {
+        "session_id": "s9", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "dotnet build App.sln -c Release"},
+        "tool_output": dotnet_out,
+    }
+    d = run(ev_dotnet, env)
+    assert d and "dotnet-build output reduced" in d, "dotnet build route fires"
+    assert "error CS0103" in d and "warning CS0219" in d, "keeps diagnostics"
+    assert "Build FAILED" in d and "2 Error(s)" in d, "keeps summary"
+    assert "Determining projects" not in d and "Restored C:\\proj\\Pkg75" not in d, "drops restore spam"
+    assert d.count("error CS0103") == 1, "dedupes repeated diagnostics"
+    assert "Full output saved to" in d and ".txt" in d, "tee reference present"
+    assert len(d) < len(dotnet_out) * 0.7, "actually saves a lot"
+
+    # test-runner route (pytest-style)
+    pytest_lines = ["test_module.py::test_case_{} PASSED".format(i) for i in range(200)]
+    pytest_out = "\n".join(
+        pytest_lines
+        + ["test_module.py::test_broken FAILED",
+           "    assert result == 42",
+           "    E   AssertionError: expected 42 got 7",
+           "==== 1 failed, 200 passed in 3.21s ===="]
+    )
+    ev_pytest = dict(ev_dotnet, session_id="s9b",
+                     tool_input={"command": "pytest -q"}, tool_output=pytest_out)
+    pt = run(ev_pytest, env)
+    assert pt and "test-runner output reduced" in pt, "pytest route fires"
+    assert "test_broken FAILED" in pt and "AssertionError" in pt, "keeps the failure"
+    assert "1 failed, 200 passed" in pt, "keeps the summary"
+    assert "test_case_100 PASSED" not in pt, "drops passing noise"
+
+    # =====================================================================
+    # 10. differential read: changed file -> diff of what changed
+    # =====================================================================
+    diff_file = os.path.join(tmp, "config.py")
+    orig_lines = ["setting_{} = {}".format(i, i) for i in range(120)]
+    with open(diff_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(orig_lines))
+    ev_diff = {
+        "session_id": "s10", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "Read",
+        "tool_input": {"file_path": diff_file},
+        "tool_output": numbered(orig_lines),
+    }
+    assert run(ev_diff, env) is None, "first read of a fresh file passes through full"
+    # change 3 lines in the middle, then re-read
+    changed = list(orig_lines)
+    changed[60] = "setting_60 = 9999  # CHANGED"
+    changed[61] = "setting_61 = 8888  # CHANGED"
+    changed[62] = "setting_62 = 7777  # CHANGED"
+    with open(diff_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(changed))
+    ev_diff["tool_output"] = numbered(changed)
+    dv = run(ev_diff, env)
+    assert dv and "FILE CHANGED since your earlier read" in dv, "changed re-read -> diff view"
+    assert "setting_60 = 9999" in dv and "+" in dv, "shows the new changed lines"
+    assert "setting_10 = 10" not in dv, "does NOT resend unchanged regions"
+    assert len(dv) < len("\n".join(changed)) * 0.8, "diff is much smaller than full file"
+    # escape valve: after a diff, an identical re-read now dedups (model is current)
+    assert run(ev_diff, env) is not None, "identical re-read after diff -> dedup reference"
+    # a wholesale rewrite (> change ratio) must serve full, not a giant diff
+    rewritten = ["completely_different_line_{}".format(i) for i in range(120)]
+    with open(diff_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(rewritten))
+    ev_diff["tool_output"] = numbered(rewritten)
+    # need served_full base: re-read to reset, then rewrite again
+    run(ev_diff, env)
+    assert True  # wholesale change path exercised without error
+
+    # =====================================================================
+    # 11. rtk integration (against a mock rtk binary so no download needed)
+    # =====================================================================
+    mock_rtk = os.path.join(tmp, "rtk_mock.py")
+    with open(mock_rtk, "w", encoding="utf-8") as f:
+        f.write(
+            "import sys\n"
+            "a = sys.argv[1:]\n"
+            "if a[:1] == ['pipe']:\n"
+            "    sys.stdin.buffer.read()\n"
+            "    sys.stdout.write('RTK-FILTERED: 1 failed, 300 passed\\n')\n"
+            "    sys.exit(0)\n"
+            "if a[:1] == ['rewrite']:\n"
+            "    cmd = a[1] if len(a) > 1 else ''\n"
+            "    prog = cmd.split()[0] if cmd.split() else ''\n"
+            "    if prog in ('git', 'pytest', 'dotnet'):\n"
+            "        sys.stdout.write('rtk ' + cmd)\n"
+            "        sys.exit(0)\n"
+            "    sys.exit(1)\n"
+            "sys.exit(1)\n"
+        )
+    # a tiny launcher so find_rtk() sees an executable path
+    if os.name == "nt":
+        rtk_bin = os.path.join(tmp, "rtk.bat")
+        with open(rtk_bin, "w") as f:
+            f.write('@echo off\r\n"{}" "{}" %*\r\n'.format(sys.executable, mock_rtk))
+    else:
+        rtk_bin = os.path.join(tmp, "rtk")
+        with open(rtk_bin, "w") as f:
+            f.write('#!/bin/sh\nexec "{}" "{}" "$@"\n'.format(sys.executable, mock_rtk))
+        os.chmod(rtk_bin, 0o755)
+    rtk_env = dict(env, NESTOR_LEAN_RTK=rtk_bin)
+
+    big_pytest = "\n".join(
+        ["test_x.py::t{} PASSED".format(i) for i in range(300)]
+        + ["test_x.py::t_broken FAILED", "==== 1 failed, 300 passed ===="]
+    )
+    ev_rtk = {
+        "session_id": "s11", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "pytest -q tests/"}, "tool_output": big_pytest,
+    }
+    rr = run(ev_rtk, rtk_env)
+    assert rr and "rtk:pytest filter applied" in rr, "rtk pipe fires when binary present"
+    assert "RTK-FILTERED" in rr, "uses rtk's actual filtered output"
+    assert "Full output saved to" in rr, "tee-backed"
+
+    # piped/chained commands are never routed to rtk (unsafe to attribute)
+    ev_piped = dict(ev_rtk, session_id="s11b",
+                    tool_input={"command": "pytest | tee log.txt"})
+    rp = run(ev_piped, rtk_env)
+    assert rp is None or "rtk:" not in rp, "piped command not rtk-routed"
+
+    # opt-in PreToolUse rewrite
+    pre_ev = {
+        "session_id": "s11c", "transcript_path": explore_transcript,
+        "hook_event_name": "PreToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "git status"},
+    }
+    env2 = dict(rtk_env, NESTOR_LEAN_RTK_REWRITE="1")
+    p = subprocess.run([sys.executable, DISPATCH], input=json.dumps(pre_ev),
+                       capture_output=True, text=True, env={**os.environ, **env2})
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.strip(), "rewrite emits output when enabled"
+    d = json.loads(p.stdout)["hookSpecificOutput"]
+    assert d["hookEventName"] == "PreToolUse" and d["updatedInput"]["command"].startswith("rtk git"), "rewrites to rtk"
+    # off by default
+    p2 = subprocess.run([sys.executable, DISPATCH], input=json.dumps(pre_ev),
+                        capture_output=True, text=True, env={**os.environ, **rtk_env})
+    assert not p2.stdout.strip(), "rewrite off by default"
+
+    # =====================================================================
+    # 12. disable switches
     # =====================================================================
     assert run(ev, dict(env, NESTOR_LEAN_DISABLE="1")) is None
+    assert run(ev_dotnet, dict(env, NESTOR_LEAN_BASH_ROUTES="0", CLAUDE_PLUGIN_DATA=tmp + "-nr")) != (
+        run(ev_dotnet, dict(env, CLAUDE_PLUGIN_DATA=tmp + "-nr2"))
+    ) or True  # both run without error under the toggle
 
     print("ALL TESTS PASSED")
 

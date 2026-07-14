@@ -1,7 +1,7 @@
 {
   "name": "nestor-lean",
-  "version": "0.3.0",
-  "description": "Input-side token compression for Claude Code: read dedup-by-reference, codemap exploration reads, duplicate-collapse for reads/grep/bash. Context-aware (PreCompact + rolling-context integration), multi-agent safe.",
+  "version": "0.4.0",
+  "description": "Input-side token compression for Claude Code: read dedup, differential reads (changed files -> diffs), codemap skill, and command-output compression via the real rtk binary + built-in routes. Context-aware, multi-agent safe.",
   "author": {
     "name": "NodeNestor"
   },

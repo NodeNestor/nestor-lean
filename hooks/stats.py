@@ -11,9 +11,13 @@ sessions_dir = os.path.join(base, "sessions")
 totals = {
     "saved_chars": 0,
     "read_refs": 0,
+    "diff_reads": 0,
     "read_collapses": 0,
     "grep_compressions": 0,
     "bash_collapses": 0,
+    "bash_routes": 0,
+    "rtk_pipes": 0,
+    "rtk_rewrites": 0,
     "codemaps": 0,
 }
 sessions = 0
@@ -33,9 +37,13 @@ print("nestor-lean savings (state retained for ~48h per agent context)")
 print("=" * 60)
 print("Agent contexts tracked:   {}".format(sessions))
 print("Duplicate reads -> refs:  {}".format(totals["read_refs"]))
+print("Changed reads -> diffs:   {}".format(totals["diff_reads"]))
 print("Codemaps served:          {}".format(totals["codemaps"]))
 print("Read outputs collapsed:   {}".format(totals["read_collapses"]))
 print("Grep outputs compressed:  {}".format(totals["grep_compressions"]))
+print("rtk filters applied:      {}".format(totals["rtk_pipes"]))
+print("rtk command rewrites:     {}".format(totals["rtk_rewrites"]))
+print("Built-in routes fired:    {}".format(totals["bash_routes"]))
 print("Bash outputs collapsed:   {}".format(totals["bash_collapses"]))
 print("Chars saved:              {:,}".format(totals["saved_chars"]))
 print("~Tokens saved:            {:,}  (chars/4 estimate)".format(totals["saved_chars"] // 4))
