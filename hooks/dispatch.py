@@ -13,11 +13,13 @@ Events handled (routed by hook_event_name):
          replaced by an orienting note (age, size, outline) pointing at the
          earlier read. Escape valve: the next identical Read after a note
          returns full content and resets the cycle.
-      2. codemap: a large full-file read of a CODE file, while the agent is
-         EXPLORING (intent inferred from the transcript tail; never while
-         error-hunting), is replaced by a structural map — signature lines
-         with real line numbers, bodies elided with counts. Same escape
-         valve: re-read -> full content.
+      2. structural map: a large full-file read of a MAPPABLE file (code,
+         markdown, HTML/markup, CSS) is replaced by signature/heading/selector
+         lines with real line numbers, bodies elided with counts. Intent
+         (inferred from the transcript tail) scales the size floor rather than
+         vetoing the map, because error-hunt vocabulary appears in ordinary
+         narration far more often than real debugging does. Same escape valve:
+         re-read -> full content.
       3. duplicate collapse: large NON-code reads (logs, dumps) get runs of
          identical consecutive lines collapsed with explicit markers.
 
@@ -26,9 +28,21 @@ Events handled (routed by hook_event_name):
       per-file caps. Skipped entirely when the pattern looks like error
       hunting (the model likely needs every occurrence).
 
-  PostToolUse / Bash
-      large command output: consecutive identical lines collapsed uniq -c
-      style with explicit markers.
+  PostToolUse / Bash, PowerShell
+      large command output: rtk filter, then built-in route, then consecutive
+      identical lines collapsed uniq -c style with explicit markers.
+
+  PostToolUse / WebFetch, WebSearch
+      a fetched page is markdown, so it gets the same structural map as a
+      document; search results get repetition collapse. Both tee-backed.
+
+  PostToolUse / Glob
+      path lists folded by directory — the shared stem written once, every
+      filename listed under it, so each path is recoverable by concatenation.
+
+  PostToolUse / Agent, TaskOutput
+      repetition collapse only. A subagent report is often the sole record of
+      work the main agent never saw, so it is never restructured.
 
   PreCompact
       Claude Code is about to compact this context -> all "the model already
@@ -69,13 +83,23 @@ def _env_int(name, default):
 
 DEDUP_WINDOW = _env_int("NESTOR_LEAN_DEDUP_WINDOW", 1200)
 MIN_DEDUP_CHARS = _env_int("NESTOR_LEAN_MIN_DEDUP_CHARS", 1500)
-GREP_MIN_CHARS = _env_int("NESTOR_LEAN_GREP_MIN_CHARS", 4000)
+GREP_MIN_CHARS = _env_int("NESTOR_LEAN_GREP_MIN_CHARS", 2000)
 GREP_PER_FILE_CAP = _env_int("NESTOR_LEAN_GREP_PER_FILE_CAP", 25)
-BASH_MIN_CHARS = _env_int("NESTOR_LEAN_BASH_MIN_CHARS", 4000)
+# Measured on a real corpus: 29% of shell output lands in the 1.5k-4k band, so
+# a 4k floor excluded most of it. MIN_SAVING_RATIO is the real safety net —
+# a transform that does not actually save 20% is discarded either way.
+BASH_MIN_CHARS = _env_int("NESTOR_LEAN_BASH_MIN_CHARS", 1500)
 MCP_MIN_CHARS = _env_int("NESTOR_LEAN_MCP_MIN_CHARS", 3000)
+WEB_MIN_CHARS = _env_int("NESTOR_LEAN_WEB_MIN_CHARS", 3000)
+GLOB_MIN_CHARS = _env_int("NESTOR_LEAN_GLOB_MIN_CHARS", 2000)
+REPORT_MIN_CHARS = _env_int("NESTOR_LEAN_REPORT_MIN_CHARS", 4000)
+WEB_ENABLED = os.environ.get("NESTOR_LEAN_WEB", "1") != "0"
 MCP_ENABLED = os.environ.get("NESTOR_LEAN_MCP", "1") != "0"
 COLLAPSE_MIN_RUN = _env_int("NESTOR_LEAN_COLLAPSE_MIN_RUN", 5)
 CODEMAP_MIN_CHARS = _env_int("NESTOR_LEAN_CODEMAP_MIN_CHARS", 12000)
+# While the agent looks like it is error-hunting, only map files big enough
+# that a full read would dominate the context anyway.
+CODEMAP_DEBUG_MIN_CHARS = _env_int("NESTOR_LEAN_CODEMAP_DEBUG_MIN_CHARS", 40000)
 CODEMAP_ENABLED = os.environ.get("NESTOR_LEAN_CODEMAP", "1") != "0"
 BASH_ROUTES_ENABLED = os.environ.get("NESTOR_LEAN_BASH_ROUTES", "1") != "0"
 RTK_ENABLED = os.environ.get("NESTOR_LEAN_RTK_PIPE", "1") != "0"
@@ -89,6 +113,10 @@ HASH_CAP_BYTES = 4 * 1024 * 1024
 STATE_MAX_AGE = 48 * 3600
 RC_PROBE_TTL = 10  # seconds to cache the rolling-context probe result
 RC_TIMEOUT = 0.25
+
+# Windows sessions run most of their commands through the PowerShell tool, so
+# leaving it out meant a large share of shell output was never seen at all.
+SHELL_TOOLS = ("Bash", "PowerShell")
 
 CODE_EXTS = {
     ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".cs",
@@ -112,6 +140,14 @@ SIG_FAMILY = {
     ".cs": "cs", ".razor": "cs", ".cshtml": "cs", ".java": "cs",
     ".go": "go", ".rs": "go", ".rb": "py", ".php": "js",
     ".c": "c", ".h": "c", ".cpp": "c", ".hpp": "c",
+    # Prose and markup map just as well as code: the "signature" is the
+    # heading / selector / structural tag, the "body" is what it introduces.
+    # Measured on a real corpus, non-code first reads are a quarter of all
+    # read bytes (markdown alone the largest single non-code extension).
+    ".md": "md", ".markdown": "md", ".mdx": "md", ".rst": "md",
+    ".html": "html", ".htm": "html", ".astro": "html", ".vue": "html",
+    ".xml": "html", ".svg": "html",
+    ".css": "css", ".scss": "css", ".sass": "css", ".less": "css",
 }
 
 SIG_PATTERNS = {
@@ -128,7 +164,34 @@ SIG_PATTERNS = {
     ),
     "go": re.compile(r"^\s*(func\b|type\b|import\b|package\b|const\b|var\b|impl\b|pub\b|fn\b|struct\b|trait\b|mod\b|use \w)"),
     "c": re.compile(r"^\s*(#include|#define|typedef\b|struct\b|enum\b|union\b|static\b|extern\b|[A-Za-z_][\w\s\*]+\([^;]*\)\s*\{?\s*$)"),
+    # ATX headings, setext underlines and fence markers — enough to navigate a
+    # document and decide which section to re-read.
+    "md": re.compile(r"^\s{0,3}(#{1,6}\s+\S|```|~~~|={3,}\s*$|-{3,}\s*$)"),
+    # Structural/landmark tags only; attributes and text content are the body.
+    "html": re.compile(
+        r"^\s*</?(!DOCTYPE|html|head|body|header|nav|main|section|article"
+        r"|aside|footer|div|form|table|thead|tbody|script|style|link|meta"
+        r"|title|template|slot|h[1-6]|ul|ol|dl|figure|canvas|svg|iframe"
+        r"|component|router-view)\b",
+        re.IGNORECASE,
+    ),
+    # Selector lines (anything opening a block) and at-rules.
+    "css": re.compile(r"^\s*(@[a-z-]+|[.#&\[:a-zA-Z][^{};]*\{\s*$|[^{};]+,\s*$)"),
 }
+
+# Extensions whose structure a map can express. Broader than CODE_EXTS, which
+# still governs the code-specific paths (error-hunt caution, collapse tier).
+MAPPABLE_EXTS = frozenset(SIG_FAMILY)
+
+# Documents that are INSTRUCTIONS rather than reference material. Eliding the
+# prose under a heading is fine for a design doc the model is navigating; it is
+# not fine for a file whose whole purpose is telling the model what to do, and
+# the "re-read to get it all" escape valve does not help when the model has no
+# reason to suspect it is missing a rule.
+NEVER_MAP_NAMES = frozenset({
+    "claude.md", "agents.md", "agent.md", "skill.md", "cursorrules",
+    ".cursorrules", "copilot-instructions.md", "conventions.md", "rules.md",
+})
 
 
 # ---------------------------------------------------------------- state ----
@@ -428,7 +491,12 @@ def dedup_note(fp, digest, age_min, text, size_bytes):
     return "\n".join(note)
 
 
-def build_codemap(text, ext):
+ELISION_NOUN = {
+    "md": "prose", "html": "markup", "css": "declarations",
+}
+
+
+def build_codemap(text, ext, debugging=False):
     """Structural map: signature lines kept with their real line numbers,
     bodies elided with explicit counts. Returns None if the file doesn't map
     cleanly or the map wouldn't save enough."""
@@ -436,6 +504,7 @@ def build_codemap(text, ext):
     pat = SIG_PATTERNS.get(fam)
     if not pat:
         return None
+    noun = ELISION_NOUN.get(fam, "implementation")
     parsed = parse_read_lines(text)
     raw_lines = text.splitlines()
     kept = []       # (lineno, rendered_line)
@@ -445,7 +514,7 @@ def build_codemap(text, ext):
     def flush_elided():
         nonlocal elided
         if elided > 0:
-            kept.append((None, "        … +{} lines (implementation)".format(elided)))
+            kept.append((None, "        … +{} lines ({})".format(elided, noun)))
             elided = 0
 
     for i, item in enumerate(parsed):
@@ -470,11 +539,13 @@ def build_codemap(text, ext):
     if len(body) >= len(text) * (1 - MIN_SAVING_RATIO):
         return None
     header = (
-        "[nestor-lean] STRUCTURAL MAP (exploration read) — implementation "
-        "bodies elided, {} signature/import lines kept with their real line "
-        "numbers. This is enough to navigate and decide where to look. "
-        "Before quoting or editing this file, re-run the exact same Read: "
-        "the full contents will be returned.\n".format(sig_count)
+        "[nestor-lean] STRUCTURAL MAP ({}) — {} elided, {} structural lines "
+        "kept with their real line numbers. This is enough to navigate and "
+        "decide where to look. Before quoting or editing this file, re-run "
+        "the exact same Read: the full contents will be returned.\n".format(
+            "large file, mid-investigation" if debugging else "exploration read",
+            noun, sig_count,
+        )
     )
     return header + body
 
@@ -857,21 +928,30 @@ def handle_read(payload, state, ckey):
     if DIFF_ENABLED and approx_len <= DIFF_MAX_CONTENT:
         new_rec["has_blob"] = store_blob(ckey, key, text)
 
-    # ---- 3. codemap for exploration reads of big code files -------------
+    # ---- 3. structural map for big first reads of mappable files ---------
+    # Intent scales the threshold instead of switching the map off. Treating
+    # error-hunting as a hard veto cost most of the opportunity: the vocabulary
+    # ("error", "fail", "debug") appears in ordinary assistant narration, so
+    # the veto fired far more often than real debugging did. A map is still a
+    # good trade on a very large file while debugging — the model reads a
+    # region next either way, and the escape valve returns full content on the
+    # next identical Read.
     if (
         CODEMAP_ENABLED
-        and is_code
+        and ext in MAPPABLE_EXTS
+        and os.path.basename(fp).lower() not in NEVER_MAP_NAMES
         and ti.get("offset") is None
         and ti.get("limit") is None
-        and approx_len >= CODEMAP_MIN_CHARS
-        and transcript_intent(payload.get("transcript_path") or "") == "explore"
     ):
-        cmap = build_codemap(text, ext)
-        if cmap is not None:
-            new_rec["map_served"] = True
-            state["saved_chars"] += len(text) - len(cmap)
-            state["codemaps"] += 1
-            return cmap
+        debugging = transcript_intent(payload.get("transcript_path") or "") != "explore"
+        floor = CODEMAP_DEBUG_MIN_CHARS if debugging else CODEMAP_MIN_CHARS
+        if approx_len >= floor:
+            cmap = build_codemap(text, ext, debugging=debugging)
+            if cmap is not None:
+                new_rec["map_served"] = True
+                state["saved_chars"] += len(text) - len(cmap)
+                state["codemaps"] += 1
+                return cmap
 
     # ---- 4. duplicate collapse for big non-code reads --------------------
     if not is_code and approx_len >= GREP_MIN_CHARS:
@@ -981,6 +1061,119 @@ def _minify_fenced_json(text):
             return "```json\n" + compact + "\n```"
         return m.group(0)
     return FENCED_JSON.sub(repl, text)
+
+
+def handle_web(payload, state):
+    """WebFetch / WebSearch output.
+
+    WebFetch returns a page rendered to markdown, which is exactly what the
+    structural map already understands: keep the headings, elide the prose,
+    say how to get it back. WebSearch returns a result list, where the win is
+    repetition rather than structure. Both are tee-backed and both refuse to
+    apply unless they clear MIN_SAVING_RATIO, so a page that does not compress
+    passes through untouched."""
+    text = extract_text(payload)
+    if not text or len(text) < WEB_MIN_CHARS:
+        return None
+    tool = payload.get("tool_name")
+    out = None
+    what = ""
+
+    if tool == "WebFetch":
+        cmap = build_codemap(text, ".md")
+        if cmap is not None:
+            out, what = cmap, "page outline"
+    if out is None:
+        collapsed = collapse_duplicate_lines(
+            text, COLLAPSE_MIN_RUN, preserve_read_numbers=False
+        )
+        if collapsed is not None:
+            out, what = collapsed, "repeated lines collapsed"
+
+    if out is None or len(out) >= len(text) * (1 - MIN_SAVING_RATIO):
+        return None
+
+    tee = write_tee(text)
+    header = "[nestor-lean] {} ({} -> {} chars).".format(what, len(text), len(out))
+    if tee:
+        header += " Full text saved to {} — Read it for anything elided.".format(tee)
+    header += "\n"
+    state["saved_chars"] += len(text) - len(out) - len(header)
+    state["web_compressions"] = state.get("web_compressions", 0) + 1
+    return header + out
+
+
+def handle_glob(payload, state):
+    """Path lists fold hard: most entries share a directory prefix.
+
+    Emits one line per directory followed by its bare filenames, which keeps
+    every path recoverable by concatenation while dropping the repeated stem."""
+    text = extract_text(payload)
+    if not text or len(text) < GLOB_MIN_CHARS:
+        return None
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 8:
+        return None
+
+    groups = []          # preserve first-seen directory order
+    index = {}
+    for line in lines:
+        path = line.strip()
+        sep = "\\" if path.rfind("\\") > path.rfind("/") else "/"
+        cut = path.rfind(sep)
+        if cut <= 0:
+            head, tail = "", path
+        else:
+            head, tail = path[:cut], path[cut + 1:]
+        if head not in index:
+            index[head] = len(groups)
+            groups.append((head, []))
+        groups[index[head]][1].append(tail)
+
+    if len(groups) >= len(lines) * 0.7:
+        return None  # little shared structure, folding buys nothing
+
+    parts = []
+    for head, names in groups:
+        parts.append("{}/  ({} files)".format(head or ".", len(names)))
+        parts.append("    " + "  ".join(names))
+    out = "\n".join(parts)
+    if len(out) >= len(text) * (1 - MIN_SAVING_RATIO):
+        return None
+
+    header = (
+        "[nestor-lean] {} paths folded by directory ({} dirs). Each full path "
+        "is its directory line joined to a name below it.\n".format(
+            len(lines), len(groups))
+    )
+    state["saved_chars"] += len(text) - len(out) - len(header)
+    state["glob_folds"] = state.get("glob_folds", 0) + 1
+    return header + out
+
+
+def handle_report(payload, state):
+    """Subagent reports and task output: prose we cannot safely restructure.
+
+    Only the unambiguous win is taken — runs of identical lines — and only
+    when it clears the saving floor. Everything else passes through, because a
+    subagent's final report is often the only record of work the main agent
+    never saw."""
+    text = extract_text(payload)
+    if not text or len(text) < REPORT_MIN_CHARS:
+        return None
+    collapsed = collapse_duplicate_lines(
+        text, COLLAPSE_MIN_RUN, preserve_read_numbers=False
+    )
+    if collapsed is None or len(collapsed) >= len(text) * (1 - MIN_SAVING_RATIO):
+        return None
+    tee = write_tee(text)
+    header = "[nestor-lean] repeated lines collapsed."
+    if tee:
+        header += " Full report saved to {}.".format(tee)
+    header += "\n"
+    state["saved_chars"] += len(text) - len(collapsed) - len(header)
+    state["report_collapses"] = state.get("report_collapses", 0) + 1
+    return header + collapsed
 
 
 def handle_mcp(payload, state):
@@ -1141,7 +1334,7 @@ def main():
         # NESTOR_LEAN_RTK_REWRITE=1.
         if (
             os.environ.get("NESTOR_LEAN_RTK_REWRITE") == "1"
-            and payload.get("tool_name") == "Bash"
+            and payload.get("tool_name") in SHELL_TOOLS
         ):
             command = str((payload.get("tool_input") or {}).get("command") or "")
             try:
@@ -1199,8 +1392,14 @@ def main():
             replacement = handle_read(payload, state, key)
         elif tool == "Grep":
             replacement = handle_grep(payload, state)
-        elif tool == "Bash":
+        elif tool in SHELL_TOOLS:
             replacement = handle_bash(payload, state)
+        elif WEB_ENABLED and tool in ("WebFetch", "WebSearch"):
+            replacement = handle_web(payload, state)
+        elif tool == "Glob":
+            replacement = handle_glob(payload, state)
+        elif tool in ("Agent", "Task", "TaskOutput"):
+            replacement = handle_report(payload, state)
         elif MCP_ENABLED and tool and tool.startswith("mcp__"):
             replacement = handle_mcp(payload, state)
     except Exception as e:

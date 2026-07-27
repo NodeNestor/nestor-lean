@@ -78,6 +78,9 @@ totals = {
     "rtk_rewrites": 0,
     "mcp_compressions": 0,
     "codemaps": 0,
+    "web_compressions": 0,
+    "glob_folds": 0,
+    "report_collapses": 0,
 }
 sessions = 0
 
@@ -116,6 +119,9 @@ print("Duplicate reads -> refs:  {}".format(totals["read_refs"]))
 print("Changed reads -> diffs:   {}".format(totals["diff_reads"]))
 print("Codemaps served:          {}".format(totals["codemaps"]))
 print("Read outputs collapsed:   {}".format(totals["read_collapses"]))
+print("Web pages compressed:     {}".format(totals["web_compressions"]))
+print("Glob path lists folded:   {}".format(totals["glob_folds"]))
+print("Agent reports collapsed:  {}".format(totals["report_collapses"]))
 print("Grep outputs compressed:  {}".format(totals["grep_compressions"]))
 print("MCP outputs compressed:   {}".format(totals["mcp_compressions"]))
 print("rtk filters applied:      {}".format(totals["rtk_pipes"]))

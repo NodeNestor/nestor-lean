@@ -587,6 +587,162 @@ def main():
     assert "OFF" in forced.stdout and "NESTOR_LEAN_DISABLE" in forced.stdout, (
         "env var must still take precedence and be named in the status")
 
+    # =====================================================================
+    # 17. PowerShell is treated as a shell, not ignored
+    # =====================================================================
+    # Windows sessions run most commands through this tool; leaving it out of
+    # the matcher meant a large share of shell output was never seen.
+    noisy = "\n".join(["processing widget batch"] * 60
+                      + ["done in {}ms".format(i) for i in range(40)])
+    ev_ps = {
+        "session_id": "s17", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "PowerShell",
+        "tool_input": {"command": "Get-Widget -All"},
+        "tool_response": noisy,
+    }
+    ps = run(ev_ps, env)
+    assert ps and "nestor-lean" in ps, "PowerShell output must be compressed"
+    assert "59 more identical" in ps or "repeat" in ps.lower(), "runs collapsed"
+    assert "done in 39ms" in ps, "non-repeating detail kept"
+
+    # =====================================================================
+    # 18. structural maps for prose and markup, not just code
+    # =====================================================================
+    def read_event(path, body, sid, transcript):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        return {
+            "session_id": sid, "transcript_path": transcript,
+            "hook_event_name": "PostToolUse", "tool_name": "Read",
+            "tool_input": {"file_path": path},
+            "tool_output": numbered(body.splitlines()),
+        }
+
+    md_body = []
+    for i in range(14):
+        md_body.append("## Section {}".format(i))
+        md_body += ["Prose line {} of section {} with real sentences in it.".format(j, i)
+                    for j in range(30)]
+    md_path = os.path.join(tmp, "doc.md")
+    md = run(read_event(md_path, "\n".join(md_body), "s18a", explore_transcript), env)
+    assert md and "STRUCTURAL MAP" in md, "markdown must map"
+    assert "## Section 13" in md, "headings kept"
+    assert "prose" in md, "elision names what was dropped"
+    assert "Prose line 5 of section 3" not in md, "prose elided"
+
+    css_body = []
+    for i in range(20):
+        css_body.append(".widget-{} {{".format(i))
+        css_body += ["    property-{}: value-{}-{};".format(j, i, j) for j in range(20)]
+        css_body.append("}")
+    css_path = os.path.join(tmp, "site.css")
+    css = run(read_event(css_path, "\n".join(css_body), "s18b", explore_transcript), env)
+    assert css and "STRUCTURAL MAP" in css, "css must map"
+    assert ".widget-19 {" in css, "selectors kept"
+
+    # instruction files are never mapped, however big: the escape valve does
+    # not help when the model has no reason to suspect a rule went missing
+    for instruction_name in ("CLAUDE.md", "AGENTS.md", "SKILL.md"):
+        ipath = os.path.join(tmp, instruction_name)
+        assert run(read_event(ipath, "\n".join(md_body), "s18-" + instruction_name,
+                              explore_transcript), env) is None, (
+            instruction_name + " must never be mapped")
+
+    # =====================================================================
+    # 19. intent scales the threshold instead of vetoing the map
+    # =====================================================================
+    # Thresholds are measured against the rendered Read output (line numbers
+    # included), not the raw file, so size these against `numbered(...)`.
+    code = []
+    for i in range(60):
+        code.append("def fn_{}(a, b):".format(i))
+        code += ["    step_{} = a + {}".format(j, j) for j in range(12)]
+        code.append("    return step_0")
+    medium = "\n".join(code)                 # ~22k numbered: over 12k, under 40k
+    huge = "\n".join(code * 4)               # ~89k numbered: over the debug floor
+    assert 12000 < len(numbered(medium.splitlines())) < 40000, "fixture sizing"
+    assert len(numbered(huge.splitlines())) > 40000, "fixture sizing"
+
+    med_path = os.path.join(tmp, "medium.py")
+    assert run(read_event(med_path, medium, "s19a", debug_transcript), env) is None, (
+        "mid-size file while error-hunting -> full content")
+    assert run(read_event(os.path.join(tmp, "medium2.py"), medium, "s19b",
+                          explore_transcript), env), "same file while exploring -> map"
+    big = run(read_event(os.path.join(tmp, "huge.py"), huge, "s19c", debug_transcript), env)
+    assert big and "STRUCTURAL MAP" in big, "very large file maps even mid-investigation"
+    assert "mid-investigation" in big, "header states why it still mapped"
+
+    # =====================================================================
+    # 20. Glob path lists fold by directory
+    # =====================================================================
+    paths = []
+    for d in ("src/core", "src/api", "src/web/components"):
+        paths += ["E:/proj/{}/module_{}.py".format(d, i) for i in range(30)]
+    assert len("\n".join(paths)) > 2000, "fixture must clear GLOB_MIN_CHARS"
+    ev_glob = {
+        "session_id": "s20", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "Glob",
+        "tool_input": {"pattern": "**/*.py"},
+        "tool_response": "\n".join(paths),
+    }
+    g = run(ev_glob, env)
+    assert g and "folded by directory" in g, "path list must fold"
+    assert "E:/proj/src/web/components/" in g, "directory line kept once"
+    assert "module_29.py" in g, "every filename still present"
+    assert g.count("E:/proj/src/api") == 1, "stem not repeated per file"
+
+    # =====================================================================
+    # 21. WebFetch pages get an outline; WebSearch gets collapse
+    # =====================================================================
+    page = []
+    for i in range(12):
+        page.append("### Heading {}".format(i))
+        page += ["Body sentence {} under heading {}.".format(j, i) for j in range(25)]
+    ev_fetch = {
+        "session_id": "s21a", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "WebFetch",
+        "tool_input": {"url": "https://example.com/doc"},
+        "tool_response": "\n".join(page),
+    }
+    wf = run(ev_fetch, env)
+    assert wf and "page outline" in wf, "WebFetch page must be outlined"
+    assert "### Heading 11" in wf, "headings kept"
+    assert "Full text saved to" in wf, "tee-backed"
+
+    ev_search = {
+        "session_id": "s21b", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "WebSearch",
+        "tool_input": {"query": "widgets"},
+        "tool_response": "\n".join(["No description available."] * 140
+                                   + ["result {}".format(i) for i in range(40)]),
+    }
+    assert len(ev_search["tool_response"]) > 3000, "fixture must clear WEB_MIN_CHARS"
+    ws = run(ev_search, env)
+    assert ws and "collapsed" in ws, "repetitive search output must collapse"
+    assert "result 39" in ws, "distinct results kept"
+
+    # =====================================================================
+    # 22. subagent reports: collapse only, never restructured
+    # =====================================================================
+    ev_agent = {
+        "session_id": "s22", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "Agent",
+        "tool_input": {"description": "audit"},
+        "tool_response": "\n".join(["checked file, no findings"] * 180
+                                   + ["FINDING: real issue at line 42"]),
+    }
+    assert len(ev_agent["tool_response"]) > 4000, "fixture must clear REPORT_MIN_CHARS"
+    ag = run(ev_agent, env)
+    assert ag and "FINDING: real issue at line 42" in ag, "findings survive"
+    assert "Full report saved to" in ag, "report is recoverable"
+
+    # a report with nothing repetitive is left completely alone
+    unique_report = "\n".join("distinct finding number {} with detail".format(i)
+                              for i in range(200))
+    assert run(dict(ev_agent, session_id="s22b",
+                    tool_response=unique_report), env) is None, (
+        "non-repetitive report passes through untouched")
+
     print("ALL TESTS PASSED")
 
 
