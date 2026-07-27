@@ -1,6 +1,6 @@
 {
   "name": "nestor-lean",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Input-side token compression for Claude Code: read dedup, differential reads, structural maps for code/markdown/markup/CSS, command-output compression (real rtk + built-in routes) across Bash and PowerShell, web page outlining, path-list folding, and MCP tool-output compression. Context-aware, multi-agent safe, tee-backed, fails open.",
   "author": {
     "name": "NodeNestor"

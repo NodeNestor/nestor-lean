@@ -71,44 +71,45 @@ import sys
 import time
 import urllib.request
 
+import config
 import switch
 
 
-def _env_int(name, default):
-    try:
-        return int(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
+# Every knob resolves through config: defaults -> preset -> user config file ->
+# project config file -> NESTOR_LEAN_* env. See hooks/config.py.
+_c = config.get
 
-
-DEDUP_WINDOW = _env_int("NESTOR_LEAN_DEDUP_WINDOW", 1200)
-MIN_DEDUP_CHARS = _env_int("NESTOR_LEAN_MIN_DEDUP_CHARS", 1500)
-GREP_MIN_CHARS = _env_int("NESTOR_LEAN_GREP_MIN_CHARS", 2000)
-GREP_PER_FILE_CAP = _env_int("NESTOR_LEAN_GREP_PER_FILE_CAP", 25)
-# Measured on a real corpus: 29% of shell output lands in the 1.5k-4k band, so
-# a 4k floor excluded most of it. MIN_SAVING_RATIO is the real safety net —
-# a transform that does not actually save 20% is discarded either way.
-BASH_MIN_CHARS = _env_int("NESTOR_LEAN_BASH_MIN_CHARS", 1500)
-MCP_MIN_CHARS = _env_int("NESTOR_LEAN_MCP_MIN_CHARS", 3000)
-WEB_MIN_CHARS = _env_int("NESTOR_LEAN_WEB_MIN_CHARS", 3000)
-GLOB_MIN_CHARS = _env_int("NESTOR_LEAN_GLOB_MIN_CHARS", 2000)
-REPORT_MIN_CHARS = _env_int("NESTOR_LEAN_REPORT_MIN_CHARS", 4000)
-WEB_ENABLED = os.environ.get("NESTOR_LEAN_WEB", "1") != "0"
-MCP_ENABLED = os.environ.get("NESTOR_LEAN_MCP", "1") != "0"
-COLLAPSE_MIN_RUN = _env_int("NESTOR_LEAN_COLLAPSE_MIN_RUN", 5)
-CODEMAP_MIN_CHARS = _env_int("NESTOR_LEAN_CODEMAP_MIN_CHARS", 12000)
+DEDUP_WINDOW = _c("dedup_window")
+MIN_DEDUP_CHARS = _c("min_dedup_chars")
+GREP_MIN_CHARS = _c("grep_min_chars")
+GREP_PER_FILE_CAP = _c("grep_per_file_cap")
+# Floors are a pre-filter, not the safety mechanism. The hook process runs on
+# every matched call regardless, so a floor skips in-process work rather than a
+# spawn; MIN_SAVING_RATIO is what actually protects correctness.
+BASH_MIN_CHARS = _c("bash_min_chars")
+MCP_MIN_CHARS = _c("mcp_min_chars")
+WEB_MIN_CHARS = _c("web_min_chars")
+GLOB_MIN_CHARS = _c("glob_min_chars")
+REPORT_MIN_CHARS = _c("report_min_chars")
+WEB_ENABLED = _c("web")
+MCP_ENABLED = _c("mcp")
+COLLAPSE_MIN_RUN = _c("collapse_min_run")
+# Layout stripping is content-preserving, so it only has to beat its own
+# header rather than a saving ratio.
+LAYOUT_MIN_SAVING = _c("layout_min_saving")
+CODEMAP_MIN_CHARS = _c("codemap_min_chars")
 # While the agent looks like it is error-hunting, only map files big enough
 # that a full read would dominate the context anyway.
-CODEMAP_DEBUG_MIN_CHARS = _env_int("NESTOR_LEAN_CODEMAP_DEBUG_MIN_CHARS", 40000)
-CODEMAP_ENABLED = os.environ.get("NESTOR_LEAN_CODEMAP", "1") != "0"
-BASH_ROUTES_ENABLED = os.environ.get("NESTOR_LEAN_BASH_ROUTES", "1") != "0"
-RTK_ENABLED = os.environ.get("NESTOR_LEAN_RTK_PIPE", "1") != "0"
+CODEMAP_DEBUG_MIN_CHARS = _c("codemap_debug_min_chars")
+CODEMAP_ENABLED = _c("codemap")
+BASH_ROUTES_ENABLED = _c("bash_routes")
+RTK_ENABLED = _c("rtk_pipe")
 TEE_MAX_AGE = 6 * 3600
-DIFF_ENABLED = os.environ.get("NESTOR_LEAN_DIFF", "1") != "0"
+DIFF_ENABLED = _c("diff")
 DIFF_MAX_CONTENT = 512 * 1024       # don't blob/diff files larger than this
-DIFF_MAX_CHANGE_RATIO = 0.45        # above this, a full read is clearer than a diff
+DIFF_MAX_CHANGE_RATIO = _c("diff_max_change_ratio")
 DIFF_CONTEXT = 3                    # context lines around each changed hunk
-MIN_SAVING_RATIO = 0.20
+MIN_SAVING_RATIO = _c("min_saving_ratio")
 HASH_CAP_BYTES = 4 * 1024 * 1024
 STATE_MAX_AGE = 48 * 3600
 RC_PROBE_TTL = 10  # seconds to cache the rolling-context probe result
@@ -660,28 +661,56 @@ def prune_blobs():
         pass
 
 
+def content_lines(text):
+    """Read output -> [(real_line_number, content)], prefixes removed.
+
+    Diffing must happen on content, never on the rendered read output. Read
+    output carries a line-number prefix per line, so inserting or deleting a
+    single line rewrites the prefix of every line after it — SequenceMatcher
+    then sees the whole tail as changed, the change ratio blows past its limit,
+    and the diff is rejected. That silently reduced differential reads to the
+    one edit shape that preserves line count.
+    """
+    parsed = parse_read_lines(text)
+    raw = text.splitlines()
+    out = []
+    for i, item in enumerate(parsed):
+        if item is not None:
+            _, lineno, _sep, content = item
+            out.append((lineno, content))
+        else:
+            out.append((i + 1, raw[i] if i < len(raw) else ""))
+    return out
+
+
 def build_diff_view(old_text, new_text, fp, age_min):
     """A unified-diff-style view of a changed file: only the changed hunks,
     with real (current) line numbers. Returns None if the change is too large
     to be worth a diff (caller then serves the full file)."""
-    old_lines = old_text.splitlines()
-    new_lines = new_text.splitlines()
+    old_pairs = content_lines(old_text)
+    new_pairs = content_lines(new_text)
+    old_lines = [c for _n, c in old_pairs]
+    new_lines = [c for _n, c in new_pairs]
     sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
     if 1.0 - sm.ratio() > DIFF_MAX_CHANGE_RATIO:
         return None
+
+    def lineno(k):
+        return new_pairs[k][0] if k < len(new_pairs) else k + 1
+
     hunks = []
     for group in sm.get_grouped_opcodes(DIFF_CONTEXT):
         rendered = []
         for tag, i1, i2, j1, j2 in group:
             if tag == "equal":
                 for k in range(j1, j2):
-                    rendered.append("  {:>6}  {}".format(k + 1, new_lines[k]))
+                    rendered.append("  {:>6}  {}".format(lineno(k), new_lines[k]))
             else:
                 for k in range(i1, i2):
                     rendered.append("  -       {}".format(old_lines[k]))
                 for k in range(j1, j2):
-                    rendered.append("  + {:>6}  {}".format(k + 1, new_lines[k]))
-        first_new = group[0][3] + 1
+                    rendered.append("  + {:>6}  {}".format(lineno(k), new_lines[k]))
+        first_new = lineno(group[0][3])
         hunks.append("@@ around line {} @@\n{}".format(first_new, "\n".join(rendered)))
     if not hunks:
         return None
@@ -1235,11 +1264,48 @@ def handle_mcp(payload, state):
     return header + out
 
 
+INTERIOR_PAD = re.compile(r"(?<=\S) {3,}(?=\S)")
+
+
+def normalize_layout(text):
+    """Drop layout-only whitespace: trailing spaces and interior column padding.
+
+    Content-preserving by construction — every non-space character survives in
+    order, and leading indentation (meaningful in JSON, YAML, tracebacks) is
+    untouched. Only alignment is lost, which costs a model nothing.
+
+    Measured worth ~11% of PowerShell output, which is mostly Format-Table
+    padding. That is below MIN_SAVING_RATIO, so this deliberately does not go
+    through the saving gate: the gate exists to reject transforms that might
+    drop information for too little gain, and this one cannot drop any.
+    """
+    out = []
+    changed = False
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r")
+        cr = raw != line
+        new = INTERIOR_PAD.sub(" ", line.rstrip())
+        if new != line:
+            changed = True
+        out.append(new + ("\r" if cr else ""))
+    if not changed:
+        return None
+    return "\n".join(out)
+
+
 def handle_bash(payload, state):
     text = extract_text(payload)
     if not text or len(text) < BASH_MIN_CHARS:
         return None
     command = str((payload.get("tool_input") or {}).get("command") or "")
+
+    # Layout normalisation first: every later tier then works on, and reports,
+    # the smaller text. On its own it is only emitted when it clears the header
+    # cost, so a line with one stray trailing space is left alone.
+    flattened = normalize_layout(text)
+    layout_saved = len(text) - len(flattened) if flattened is not None else 0
+    if flattened is not None and layout_saved > 0:
+        text = flattened
 
     # ---- 0. real rtk parser via `rtk pipe` (no re-execution) ------------
     # If the rtk binary is available and the command maps to one of its
@@ -1293,15 +1359,29 @@ def handle_bash(payload, state):
     collapsed = collapse_duplicate_lines(
         text, COLLAPSE_MIN_RUN, preserve_read_numbers=False
     )
-    if collapsed is None or len(collapsed) >= len(text) * (1 - 0.15):
-        return None
-    header = (
-        "[nestor-lean] command output collapsed (identical consecutive lines "
-        "shown once with explicit repeat counts).\n"
-    )
-    state["saved_chars"] += len(text) - len(collapsed) - len(header)
-    state["bash_collapses"] += 1
-    return header + collapsed
+    if collapsed is not None and len(collapsed) < len(text) * (1 - 0.15):
+        header = (
+            "[nestor-lean] command output collapsed (identical consecutive "
+            "lines shown once with explicit repeat counts).\n"
+        )
+        state["saved_chars"] += len(text) - len(collapsed) - len(header)
+        state["bash_collapses"] += 1
+        return header + collapsed
+
+    # ---- 3. layout normalisation alone -----------------------------------
+    # Nothing structural applied, but the padding strip already paid for
+    # itself. No saving-ratio gate here: no characters of content were
+    # removed, so there is nothing to trade off against.
+    if layout_saved > LAYOUT_MIN_SAVING:
+        header = (
+            "[nestor-lean] layout whitespace removed (trailing spaces and "
+            "column padding; every character of content is unchanged).\n"
+        )
+        if layout_saved > len(header):
+            state["saved_chars"] += layout_saved - len(header)
+            state["layout_strips"] = state.get("layout_strips", 0) + 1
+            return header + text
+    return None
 
 
 # ----------------------------------------------------------------- main ----

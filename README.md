@@ -102,8 +102,42 @@ opt-out rather than a mid-session check.
 
 ## Configuration
 
+```
+/nestor-lean:config                      show every setting and where it came from
+/nestor-lean:config preset aggressive    floors near zero — more coverage
+/nestor-lean:config preset conservative  higher floors — fewer, larger interventions
+/nestor-lean:config bash_min_chars 500   change one setting
+/nestor-lean:config --project ...        write ./.nestor-lean.json instead
+/nestor-lean:config --reset              clear it
+```
+
+Resolution order, lowest priority first: **defaults → preset → `~/.nestor-lean/config.json`
+→ `./.nestor-lean.json` → `NESTOR_LEAN_*` environment**. The config printout names
+the source of every value, so a setting that "won't change" is never a mystery.
+No restart — changes apply to the next tool call.
+
+**On the floors.** They are a cheap pre-filter, not the safety mechanism. The
+hook process runs on every matched tool call whether or not a floor is met, so a
+floor skips a few microseconds of in-process work rather than a process spawn.
+`min_saving_ratio` is what actually protects you: any transform failing to save
+that fraction is discarded and the original passes through untouched. Lowering
+floors therefore buys coverage very cheaply. Swept on a read-heavy sample:
+
+| structural-map floor | saved | Read transforms fired |
+|---|---:|---:|
+| 12k (old default) | 27.8% | 29 |
+| **6k (default)** | **32.8%** | 46 |
+| 3k | 34.3% | 60 |
+| 3k + every other floor at 500 | 34.7% | 61 |
+
+6k is the knee — most of the value, without mapping files small enough that the
+map is barely smaller than the file. Removing the floors entirely buys 0.4
+points on top, which is why `aggressive` exists but is not the default.
+
 | Env var | Default | Meaning |
 |---|---|---|
+| `NESTOR_LEAN_PRESET` | `balanced` | `conservative` \| `balanced` \| `aggressive` |
+| `NESTOR_LEAN_MIN_SAVING_RATIO` | `0.20` | the real guard: discard transforms saving less |
 | `NESTOR_LEAN_DISABLE` | — | `1` disables everything |
 | `NESTOR_LEAN_DIFF` | `1` | `0` disables differential reads |
 | `NESTOR_LEAN_CODEMAP` | `1` | `0` disables auto single-file codemap |

@@ -357,6 +357,38 @@ def main():
     assert "setting_60 = 9999" in dv and "+" in dv, "shows the new changed lines"
     assert "setting_10 = 10" not in dv, "does NOT resend unchanged regions"
     assert len(dv) < len("\n".join(changed)) * 0.8, "diff is much smaller than full file"
+
+    # Insertions and deletions must diff too. Diffing the RENDERED read output
+    # cannot do this: one inserted line rewrites the number prefix of every
+    # following line, the change ratio blows past its limit, and the diff is
+    # rejected — which quietly limited this tier to same-line-count edits.
+    for label, mutate in (
+        ("insert", lambda ls: ls[:60] + ["setting_new = 'inserted'"] + ls[60:]),
+        ("delete", lambda ls: ls[:60] + ls[61:]),
+        ("insert many", lambda ls: ls[:60] + ["extra_{} = {}".format(i, i)
+                                              for i in range(5)] + ls[60:]),
+    ):
+        base = ["setting_{} = {}".format(i, i) for i in range(120)]
+        fpath = os.path.join(tmp, "cfg_{}.py".format(label.replace(" ", "_")))
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write("\n".join(base))
+        ev = {"session_id": "s10-" + label, "transcript_path": explore_transcript,
+              "hook_event_name": "PostToolUse", "tool_name": "Read",
+              "tool_input": {"file_path": fpath}, "tool_output": numbered(base)}
+        assert run(ev, env) is None, "first read is full"
+        after = mutate(base)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write("\n".join(after))
+        ev["tool_output"] = numbered(after)
+        d = run(ev, env)
+        assert d and "FILE CHANGED" in d, label + " must still produce a diff"
+        assert len(d) < len(numbered(after)) * 0.6, label + " diff must be small"
+        # numbers appear once per line, not twice (the rendered prefix is gone)
+        body_lines = [l for l in d.splitlines()
+                      if l.startswith(("  ", "  + ", "  - ")) and "=" in l]
+        assert body_lines, label + " produced no diff body"
+        assert not any("→" in l for l in body_lines), (
+            label + ": read-output arrows leaked into the diff")
     # escape valve: after a diff, an identical re-read now dedups (model is current)
     assert run(ev_diff, env) is not None, "identical re-read after diff -> dedup reference"
     # a wholesale rewrite (> change ratio) must serve full, not a giant diff
@@ -605,6 +637,30 @@ def main():
     assert "59 more identical" in ps or "repeat" in ps.lower(), "runs collapsed"
     assert "done in 39ms" in ps, "non-repeating detail kept"
 
+    # Format-Table style padding is layout, not content: strip it even though
+    # it never reaches the 20% saving ratio on its own.
+    table = "\n".join(
+        "Name{}    Id{}      CPU{}   ".format(" " * 8, " " * 6, " " * 4)
+        if i == 0 else
+        "proc_{}{}  {}{}   {}.{}    ".format(i, " " * 6, 1000 + i, " " * 5, i, i)
+        for i in range(120)
+    )
+    ev_table = {
+        "session_id": "s17b", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "PowerShell",
+        "tool_input": {"command": "Get-Process | Format-Table"},
+        "tool_response": table,
+    }
+    t = run(ev_table, env)
+    assert t and "layout whitespace removed" in t, "column padding must be stripped"
+    assert "proc_119" in t and "1119" in t, "every value survives"
+    assert "        " not in t.split("\n", 1)[1], "no run of padding left"
+    # and a clean output is left completely alone
+    assert run(dict(ev_table, session_id="s17c",
+                    tool_response="\n".join("clean line {}".format(i)
+                                            for i in range(200))), env) is None, (
+        "output with no layout waste and no repetition passes through")
+
     # =====================================================================
     # 18. structural maps for prose and markup, not just code
     # =====================================================================
@@ -742,6 +798,72 @@ def main():
     assert run(dict(ev_agent, session_id="s22b",
                     tool_response=unique_report), env) is None, (
         "non-repetitive report passes through untouched")
+
+    # =====================================================================
+    # 23. configuration: presets, files, and precedence
+    # =====================================================================
+    cfg_home = os.path.join(tmp, "cfghome")
+    proj_dir = os.path.join(tmp, "proj")
+    os.makedirs(proj_dir, exist_ok=True)
+    cfgcmd = os.path.join(HERE, "..", "hooks", "configcmd.py")
+
+    def cfg(*args, cwd=None, extra_env=None):
+        e = dict(os.environ, NESTOR_LEAN_HOME=cfg_home)
+        for k in list(e):
+            if k.startswith("NESTOR_LEAN_") and k != "NESTOR_LEAN_HOME":
+                del e[k]
+        e.update(extra_env or {})
+        p = subprocess.run([sys.executable, cfgcmd] + list(args),
+                           capture_output=True, text=True,
+                           cwd=cwd or proj_dir, env=e)
+        assert p.returncode == 0, p.stdout + p.stderr
+        return p.stdout
+
+    def value_of(out, name):
+        for line in out.splitlines():
+            parts = line.split()
+            if parts and parts[0] == name:
+                return parts[1]
+        raise AssertionError(name + " missing from config output")
+
+    assert value_of(cfg(), "bash_min_chars") == "1500", "ships balanced"
+
+    cfg("preset", "aggressive")
+    out = cfg()
+    assert value_of(out, "bash_min_chars") == "500", "preset lowers floors"
+    assert value_of(out, "codemap_min_chars") == "3000", "preset lowers map floor"
+    assert "preset:aggressive" in out, "source is attributed to the preset"
+
+    cfg("preset", "conservative")
+    assert value_of(cfg(), "bash_min_chars") == "4000", "conservative raises floors"
+
+    # explicit setting beats the preset
+    cfg("bash_min_chars", "777")
+    assert value_of(cfg(), "bash_min_chars") == "777", "explicit beats preset"
+
+    # project config beats the user config
+    with open(os.path.join(proj_dir, ".nestor-lean.json"), "w", encoding="utf-8") as f:
+        json.dump({"bash_min_chars": 321}, f)
+    assert value_of(cfg(), "bash_min_chars") == "321", "project beats user"
+
+    # environment beats every file
+    out = cfg(extra_env={"NESTOR_LEAN_BASH_MIN_CHARS": "111"})
+    assert value_of(out, "bash_min_chars") == "111", "env beats files"
+    assert "env NESTOR_LEAN_BASH_MIN_CHARS" in out, "env source is named"
+
+    # and the dispatcher actually honours a config file, not just the printout
+    ev_cfg = {
+        "session_id": "s23", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "Bash",
+        "tool_input": {"command": "run-it"},
+        "tool_response": "\n".join(["same line"] * 40),   # ~360 chars
+    }
+    base_env = {k: v for k, v in env.items()}
+    below = dict(base_env, NESTOR_LEAN_HOME=cfg_home)
+    assert run(ev_cfg, dict(below, NESTOR_LEAN_BASH_MIN_CHARS="1500")) is None, (
+        "under the floor -> untouched")
+    assert run(ev_cfg, dict(below, NESTOR_LEAN_BASH_MIN_CHARS="100")), (
+        "lowering the floor via config exposes it")
 
     print("ALL TESTS PASSED")
 
