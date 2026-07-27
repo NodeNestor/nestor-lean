@@ -3,6 +3,8 @@
 import json
 import os
 
+import switch
+
 def candidate_bases():
     """Every place hook state could live, most authoritative first.
 
@@ -105,6 +107,10 @@ for base in candidate_bases():
 
 print("nestor-lean savings (state retained for ~48h per agent context)")
 print("=" * 60)
+if switch.is_disabled():
+    # Otherwise a switched-off plugin just looks like a broken one.
+    print("STATUS: OFF — nothing is being compressed (/nestor-lean:on to resume)")
+    print("-" * 60)
 print("Agent contexts tracked:   {}".format(sessions))
 print("Duplicate reads -> refs:  {}".format(totals["read_refs"]))
 print("Changed reads -> diffs:   {}".format(totals["diff_reads"]))

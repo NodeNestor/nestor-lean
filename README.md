@@ -54,6 +54,22 @@ Requires Python 3.7+ (stdlib only). To enable the real-rtk tier, either install 
 /nestor-lean:gain
 ```
 
+## Turning it off (and back on)
+
+```
+/nestor-lean:off      # stop compressing, from the very next tool call
+/nestor-lean:on       # resume
+```
+
+No restart, no config edit. Everything passes through untouched while off, and
+`/nestor-lean:gain` says so rather than just reporting zeros. This is the switch
+to reach for when a tool result looks wrong and you want to rule nestor-lean out
+in one command — which matters more than the savings do.
+
+`NESTOR_LEAN_DISABLE=1` still works and still wins over the switch, but it lives
+in settings.json env and needs a Claude Code restart, so it suits permanent
+opt-out rather than a mid-session check.
+
 ## Configuration
 
 | Env var | Default | Meaning |

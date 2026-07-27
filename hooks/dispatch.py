@@ -57,6 +57,8 @@ import sys
 import time
 import urllib.request
 
+import switch
+
 
 def _env_int(name, default):
     try:
@@ -1112,7 +1114,9 @@ def handle_bash(payload, state):
 # ----------------------------------------------------------------- main ----
 
 def main():
-    if os.environ.get("NESTOR_LEAN_DISABLE") == "1":
+    # Checked per invocation, not at import: /nestor-lean:off must take effect
+    # on the very next tool call without a restart.
+    if switch.is_disabled():
         return
     try:
         payload = json.load(sys.stdin)

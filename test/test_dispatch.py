@@ -539,6 +539,54 @@ def main():
     assert out2.returncode == 0, out2.stderr
     assert "4,242" in out2.stdout, "overlapping roots must not double-count"
 
+    # =====================================================================
+    # 16. runtime on/off switch
+    # =====================================================================
+    # The env var needs a Claude Code restart; the flag file must take effect
+    # on the very next tool call, so the dispatcher has to read it per run.
+    switch_py = os.path.join(HERE, "..", "hooks", "switch.py")
+    lean_home = os.path.join(tmp, "switchhome")
+    sw_env = dict(env, NESTOR_LEAN_HOME=lean_home)
+    # State keys on transcript_path, not session_id — this case needs its own
+    # transcript or it inherits the dedup state left by the tests above.
+    switch_transcript = os.path.join(tmp, "switch.jsonl")
+    write_transcript(switch_transcript, [
+        "Let me look around the codebase to understand how routing works.",
+    ])
+
+    def sw(action):
+        p = subprocess.run([sys.executable, switch_py, action],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, NESTOR_LEAN_HOME=lean_home))
+        assert p.returncode == 0, p.stderr
+        return p.stdout
+
+    assert "ON" in sw("status"), "starts on"
+
+    ev_sw = dict(ev, session_id="s16", transcript_path=switch_transcript)
+    assert run(ev_sw, sw_env) is None, "first read passes through"
+    assert run(ev_sw, sw_env) is not None, "second read dedups while on"
+
+    sw("off")
+    assert "OFF" in sw("status"), "status reflects the flag"
+    assert os.path.exists(os.path.join(lean_home, "disabled")), "flag file written"
+    # same repeated read that just deduped must now pass straight through,
+    # with no restart in between
+    assert run(ev_sw, sw_env) is None, "switched off -> no compression"
+    assert run(ev_sw, sw_env) is None, "still off on the next call"
+
+    sw("on")
+    assert "ON" in sw("status"), "switched back on"
+    assert run(ev_sw, sw_env) is None, "first read after resume rebuilds state"
+    assert run(ev_sw, sw_env) is not None, "dedup works again after resume"
+
+    # the env var still wins, and says so
+    forced = subprocess.run(
+        [sys.executable, switch_py, "status"], capture_output=True, text=True,
+        env=dict(os.environ, NESTOR_LEAN_HOME=lean_home, NESTOR_LEAN_DISABLE="1"))
+    assert "OFF" in forced.stdout and "NESTOR_LEAN_DISABLE" in forced.stdout, (
+        "env var must still take precedence and be named in the status")
+
     print("ALL TESTS PASSED")
 
 

@@ -21,6 +21,8 @@ import tarfile
 import urllib.request
 import zipfile
 
+import switch
+
 REQUIRED_RTK_VERSION = "v0.42.3"
 RTK_REPO = "rtk-ai/rtk"
 
@@ -148,6 +150,9 @@ def bootstrap(force=False):
 
 def main():
     force = "--force" in sys.argv[1:]
+    if not force and switch.is_disabled():
+        # Off means off — don't fetch a binary for a plugin that won't run.
+        return
     # Consume the SessionStart hook stdin if present (ignored).
     try:
         if not sys.stdin.isatty():
