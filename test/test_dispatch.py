@@ -75,6 +75,16 @@ def write_transcript(path, texts):
             }) + "\n")
 
 
+def transcript_intent_via(path):
+    """Ask the dispatcher itself what intent it infers for a transcript."""
+    code = ("import sys; sys.path.insert(0, r'{}'); import dispatch; "
+            "print(dispatch.transcript_intent(r'{}'))").format(
+                os.path.join(HERE, "..", "hooks"), path)
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    return p.stdout.strip()
+
+
 def numbered(body_lines, start=1):
     return "\n".join("{:>6}→{}".format(i + start, l) for i, l in enumerate(body_lines))
 
@@ -798,6 +808,90 @@ def main():
     assert run(dict(ev_agent, session_id="s22b",
                     tool_response=unique_report), env) is None, (
         "non-repetitive report passes through untouched")
+
+    # =====================================================================
+    # 25. the shapes a real session actually produces
+    # =====================================================================
+    # Two things every earlier test got wrong about reality:
+    #
+    #  a) At the first PostToolUse of a session the transcript usually has no
+    #     assistant text yet. Intent used to answer "debug" there, which put the
+    #     biggest orientation read of the session behind the highest floor —
+    #     mapping almost never fired live even though it fired in every replay.
+    #  b) Claude Code's Read carries RAW file content in file.content; the line
+    #     numbers are presentation. Fixtures that pre-number the body were
+    #     testing a shape the tool does not send.
+    empty_transcript = os.path.join(tmp, "empty.jsonl")
+    open(empty_transcript, "w", encoding="utf-8").close()
+    assert transcript_intent_via(empty_transcript) == "explore", (
+        "no evidence must not mean 'debugging'")
+
+    raw_doc = []
+    for i in range(30):
+        raw_doc.append("## Chapter {}".format(i))
+        raw_doc += ["Sentence {} of chapter {} with enough text to matter.".format(j, i)
+                    for j in range(12)]
+    raw_body = "\n".join(raw_doc)
+    raw_path = os.path.join(tmp, "handbook.md")
+    with open(raw_path, "w", encoding="utf-8") as f:
+        f.write(raw_body)
+
+    ev_raw = {
+        "session_id": "s25", "transcript_path": empty_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "Read",
+        "tool_input": {"file_path": raw_path},
+        # the real shape: raw content, no line-number prefixes
+        "tool_response": {"type": "text", "file": {
+            "filePath": raw_path, "content": raw_body,
+            "numLines": len(raw_doc), "startLine": 1, "totalLines": len(raw_doc)}},
+    }
+    rr = run(ev_raw, env)
+    assert rr and "STRUCTURAL MAP" in rr, (
+        "a fresh session's first big read must still map")
+    # The escape hatch must survive the host reusing an identical Read's
+    # result: a range read is never summarized, so it always gets real bytes.
+    assert "offset=1" in rr, "map must offer a cache-proof way back to full content"
+    assert run(dict(ev_raw, session_id="s25c",
+                    tool_input={"file_path": raw_path, "offset": 1}), env) is None, (
+        "an explicit range read must never be summarized")
+    assert "## Chapter 29" in rr, "headings kept from raw content"
+    assert "Sentence 5 of chapter 3" not in rr, "prose elided"
+
+    # explicit error-hunting still raises the bar
+    assert run(dict(ev_raw, session_id="s25b",
+                    transcript_path=debug_transcript), env) is None, (
+        "stated error-hunting still holds a mid-size file back")
+
+    # =====================================================================
+    # 24. grep folds by file when there is no repeated match text
+    # =====================================================================
+    # Measured: identical match text is 0.1% of grep bytes, so the collapse
+    # tier sat idle. The repeated path prefix is 9.4%, and folding it away is
+    # lossless.
+    grep_lines = []
+    for f in range(12):
+        for ln in range(9):
+            grep_lines.append(
+                "/srv/example/src/subsystem/module_{}.py:{}:    "
+                "distinct match {} in file {}".format(f, 100 + ln, ln, f))
+    ev_fold = {
+        "session_id": "s24", "transcript_path": explore_transcript,
+        "hook_event_name": "PostToolUse", "tool_name": "Grep",
+        "tool_input": {"pattern": "widget", "output_mode": "content"},
+        "tool_response": "\n".join(grep_lines),
+    }
+    gf = run(ev_fold, env)
+    assert gf and "folded by file" in gf, "grep with no repeats must fold by path"
+    assert gf.count("/srv/example/src/subsystem/module_7.py") == 1, (
+        "each path appears once, not once per match")
+    assert "distinct match 8 in file 11" in gf, "every match survives"
+    assert "108:" in gf, "real line numbers survive"
+    assert len(gf) < len(ev_fold["tool_response"]) * 0.85, "folding actually shrinks"
+
+    # one match per file: the heading costs as much as the prefix saves
+    sparse = "\n".join("/srv/example/f_{}.py:{}:hit".format(i, i) for i in range(30))
+    assert run(dict(ev_fold, session_id="s24b", tool_response=sparse), env) is None, (
+        "one match per file -> folding buys nothing, pass through")
 
     # =====================================================================
     # 23. configuration: presets, files, and precedence

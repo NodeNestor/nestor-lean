@@ -399,8 +399,15 @@ def transcript_intent(transcript_path):
     Reads the tail of the agent's own transcript (the only place the model's
     intent is visible to a hook) and looks at the last few visible text
     passages from the user and assistant. Any error-hunting vocabulary ->
-    "debug". Unreadable/unparseable -> "debug" (the conservative answer:
-    debug mode disables codemap, never breaks anything).
+    "debug".
+
+    No evidence either way -> "explore". This used to answer "debug", which
+    looked like the conservative choice but was the wrong default in practice:
+    when PostToolUse fires for the FIRST tool call of a session the transcript
+    usually has no assistant text in it yet, so every session began in "debug"
+    — and the first big orientation read, the one most worth mapping, was the
+    one systematically excluded. "debug" now requires actual evidence of
+    error-hunting; absence of evidence is not evidence.
     """
     try:
         size = os.path.getsize(transcript_path)
@@ -409,7 +416,7 @@ def transcript_intent(transcript_path):
                 f.seek(-65536, os.SEEK_END)
             tail = f.read().decode("utf-8", "replace")
     except Exception:
-        return "debug"
+        return "explore"
 
     texts = []
     for line in reversed(tail.splitlines()):
@@ -432,7 +439,7 @@ def transcript_intent(transcript_path):
                     if isinstance(t, str) and t.strip():
                         texts.append(t)
     if not texts:
-        return "debug"
+        return "explore"
     recent = "\n".join(texts[:3])
     return "debug" if ERROR_HUNT.search(recent) else "explore"
 
@@ -542,8 +549,11 @@ def build_codemap(text, ext, debugging=False):
     header = (
         "[nestor-lean] STRUCTURAL MAP ({}) — {} elided, {} structural lines "
         "kept with their real line numbers. This is enough to navigate and "
-        "decide where to look. Before quoting or editing this file, re-run "
-        "the exact same Read: the full contents will be returned.\n".format(
+        "decide where to look. Before quoting or editing this file, get the "
+        "real contents: re-run the exact same Read, or — if that returns this "
+        "summary again — Read it with offset=1, which is never summarized. "
+        "Reading any explicit line range always returns those lines "
+        "verbatim.\n".format(
             "large file, mid-investigation" if debugging else "exploration read",
             noun, sig_count,
         )
@@ -1006,6 +1016,45 @@ def handle_read(payload, state, ckey):
 GREP_LINE = re.compile(r"^(.*?):(\d+):(.*)$")
 
 
+def fold_grep_by_file(text):
+    """`path:line:match` -> one heading per file, then `line: match` under it.
+
+    Lossless: every path, line number and match survives, and each original
+    line is its heading joined to the entry below it. Returns None when the
+    output is not in that shape, or when folding would not shrink it.
+    """
+    groups = []
+    index = {}
+    other = []
+    matched = 0
+    for raw in text.splitlines():
+        m = GREP_LINE.match(raw)
+        if not m:
+            if raw.strip():
+                other.append(raw)
+            continue
+        matched += 1
+        path, lineno, content = m.group(1), m.group(2), m.group(3)
+        if path not in index:
+            index[path] = len(groups)
+            groups.append((path, []))
+        groups[index[path]][1].append("{:>7}: {}".format(lineno, content))
+
+    if matched < 3 or not groups:
+        return None
+    if len(groups) >= matched * 0.8:
+        return None  # ~one match per file: the heading costs as much as it saves
+
+    parts = []
+    for path, entries in groups:
+        parts.append("{}  ({} match{})".format(
+            path, len(entries), "" if len(entries) == 1 else "es"))
+        parts.extend(entries)
+    parts.extend(other)
+    out = "\n".join(parts)
+    return out if len(out) < len(text) else None
+
+
 def handle_grep(payload, state):
     ti = payload.get("tool_input") or {}
     if ti.get("output_mode") != "content":
@@ -1059,6 +1108,24 @@ def handle_grep(payload, state):
 
     new_text = "\n".join(rendered)
     if len(new_text) >= len(text) * (1 - MIN_SAVING_RATIO):
+        # Collapsing identical match text almost never pays — measured at 0.1%
+        # of grep bytes on a real corpus, which is why this tier used to sit
+        # idle. The redundancy that IS there is the path repeated on every
+        # match line, so fold by file instead. That rewrite is lossless (each
+        # match is its file header joined to its line below), so like layout
+        # stripping it only has to beat its own header rather than clear the
+        # saving ratio.
+        folded = fold_grep_by_file(text)
+        if folded is not None:
+            saved = len(text) - len(folded)
+            fold_header = (
+                "[nestor-lean] grep output folded by file — each match below a "
+                "file heading belongs to that file; line numbers are real.\n"
+            )
+            if saved > len(fold_header) + LAYOUT_MIN_SAVING:
+                state["saved_chars"] += saved - len(fold_header)
+                state["grep_compressions"] += 1
+                return fold_header + folded
         return None
     header = (
         "[nestor-lean] grep output compressed: {} -> {} lines (identical "

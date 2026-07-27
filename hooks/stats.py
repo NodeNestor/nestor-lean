@@ -81,6 +81,7 @@ totals = {
     "web_compressions": 0,
     "glob_folds": 0,
     "report_collapses": 0,
+    "layout_strips": 0,
 }
 sessions = 0
 
