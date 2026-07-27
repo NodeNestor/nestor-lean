@@ -3,10 +3,66 @@
 import json
 import os
 
-base = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.join(
-    os.path.expanduser("~"), ".nestor-lean"
-)
-sessions_dir = os.path.join(base, "sessions")
+def candidate_bases():
+    """Every place hook state could live, most authoritative first.
+
+    Hooks get CLAUDE_PLUGIN_DATA from Claude Code, but /gain runs stats.py
+    through Bash, which inherits neither CLAUDE_PLUGIN_DATA nor
+    CLAUDE_PLUGIN_ROOT (the command body's ${CLAUDE_PLUGIN_ROOT} is expanded
+    before the shell sees it). Reading only the env var — or only the legacy
+    ~/.nestor-lean fallback — therefore reports zero on a real install, so
+    also walk up from wherever this script actually lives:
+
+        <config>/plugins/cache/<marketplace>/<plugin>/<version>/hooks/stats.py
+        <config>/plugins/data/<plugin>-<marketplace>/sessions
+    """
+    seen = set()
+    bases = []
+
+    def add(path):
+        if not path:
+            return
+        try:
+            key = os.path.realpath(path)
+        except OSError:
+            key = os.path.abspath(path)
+        if key in seen:
+            return
+        seen.add(key)
+        bases.append(path)
+
+    def add_siblings_of(start):
+        """From any path inside the plugins tree, find plugins/data/nestor-lean*."""
+        if not start:
+            return
+        d = os.path.abspath(start)
+        while True:
+            if os.path.basename(d) == "plugins":
+                data = os.path.join(d, "data")
+                if os.path.isdir(data):
+                    for name in sorted(os.listdir(data)):
+                        if name == "nestor-lean" or name.startswith("nestor-lean-"):
+                            add(os.path.join(data, name))
+                return
+            parent = os.path.dirname(d)
+            if parent == d:
+                return
+            d = parent
+
+    def add_from_config(config_dir):
+        add_siblings_of(os.path.join(config_dir, "plugins", "x"))
+
+    add(os.environ.get("CLAUDE_PLUGIN_DATA"))
+
+    # A plugin installed from a local/directory marketplace runs in place, so
+    # CLAUDE_PLUGIN_ROOT (and this file) can sit outside the plugins tree —
+    # go at the config dir directly too.
+    add_from_config(os.environ.get("CLAUDE_CONFIG_DIR")
+                    or os.path.join(os.path.expanduser("~"), ".claude"))
+    add_siblings_of(os.environ.get("CLAUDE_PLUGIN_ROOT"))
+    add_siblings_of(os.path.dirname(os.path.abspath(__file__)))
+    add(os.path.join(os.path.expanduser("~"), ".nestor-lean"))
+    return bases
 
 totals = {
     "saved_chars": 0,
@@ -23,13 +79,26 @@ totals = {
 }
 sessions = 0
 
-if os.path.isdir(sessions_dir):
-    for name in os.listdir(sessions_dir):
+counted = set()
+
+for base in candidate_bases():
+    sessions_dir = os.path.join(base, "sessions")
+    if not os.path.isdir(sessions_dir):
+        continue
+    for name in sorted(os.listdir(sessions_dir)):
+        path = os.path.join(sessions_dir, name)
         try:
-            with open(os.path.join(sessions_dir, name), "r", encoding="utf-8") as f:
+            key = os.path.realpath(path)
+        except OSError:
+            key = os.path.abspath(path)
+        if key in counted:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
                 s = json.load(f)
         except Exception:
             continue
+        counted.add(key)
         sessions += 1
         for k in totals:
             totals[k] += s.get(k, 0)

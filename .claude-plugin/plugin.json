@@ -1,9 +1,8 @@
 {
   "name": "nestor-lean",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Input-side token compression for Claude Code: read dedup, differential reads, codemap skill, command-output compression (real rtk + built-in routes), and MCP tool-output compression. Context-aware, multi-agent safe, tee-backed, fails open.",
   "author": {
     "name": "NodeNestor"
-  },
-  "hooks": "./hooks/hooks.json"
+  }
 }

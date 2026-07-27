@@ -494,6 +494,51 @@ def main():
         run(ev_dotnet, dict(env, CLAUDE_PLUGIN_DATA=tmp + "-nr2"))
     ) or True  # both run without error under the toggle
 
+    # =====================================================================
+    # 14. plugin manifest must not re-declare the auto-loaded hooks file
+    # =====================================================================
+    # Claude Code loads hooks/hooks.json automatically; manifest.hooks is only
+    # for *additional* files, so pointing it back at the standard path makes
+    # the whole plugin report "failed to load". See issue #1.
+    manifest_path = os.path.join(HERE, "..", ".claude-plugin", "plugin.json")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    assert "hooks" not in manifest, (
+        "plugin.json must not set 'hooks' — hooks/hooks.json is auto-loaded "
+        "and re-declaring it fails the plugin load"
+    )
+    assert os.path.isfile(os.path.join(HERE, "..", "hooks", "hooks.json")), (
+        "hooks/hooks.json must exist at the standard path to be auto-loaded"
+    )
+
+    # =====================================================================
+    # 15. /gain finds hook state without CLAUDE_PLUGIN_DATA in the env
+    # =====================================================================
+    # Slash commands run stats.py through Bash, which inherits neither
+    # CLAUDE_PLUGIN_DATA nor CLAUDE_PLUGIN_ROOT, so resolution has to fall
+    # back to the config dir — otherwise /gain always reports zero.
+    stats = os.path.join(HERE, "..", "hooks", "stats.py")
+    cfg = os.path.join(tmp, "fakecfg")
+    state_dir = os.path.join(cfg, "plugins", "data", "nestor-lean-somemarket", "sessions")
+    os.makedirs(state_dir)
+    with open(os.path.join(state_dir, "abc123.json"), "w", encoding="utf-8") as f:
+        json.dump({"saved_chars": 4242, "read_refs": 3}, f)
+
+    bare = dict(os.environ)
+    bare.pop("CLAUDE_PLUGIN_DATA", None)
+    bare.pop("CLAUDE_PLUGIN_ROOT", None)
+    bare["CLAUDE_CONFIG_DIR"] = cfg
+    out = subprocess.run([sys.executable, stats], capture_output=True, text=True, env=bare)
+    assert out.returncode == 0, out.stderr
+    assert "4,242" in out.stdout, "stats.py must read the plugin data dir under the config dir"
+    assert "Duplicate reads -> refs:  3" in out.stdout, "counters must aggregate"
+
+    # each state file is counted once even when several roots resolve to it
+    both = dict(bare, CLAUDE_PLUGIN_DATA=os.path.dirname(state_dir))
+    out2 = subprocess.run([sys.executable, stats], capture_output=True, text=True, env=both)
+    assert out2.returncode == 0, out2.stderr
+    assert "4,242" in out2.stdout, "overlapping roots must not double-count"
+
     print("ALL TESTS PASSED")
 
 
